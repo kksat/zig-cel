@@ -213,44 +213,46 @@ pub const Value = union(enum) {
         }
     }
 
-    /// Exact equality between an i64 and an f64 on the number line.
-    fn intDoubleEql(i: i64, d: f64) bool {
-        if (std.math.isNan(d) or std.math.isInf(d)) return false;
-        const t = @trunc(d);
-        if (t != d) return false;
-        if (t >= 9223372036854775808.0) return false; // >= 2^63
-        if (t < -9223372036854775808.0) return false; // < -2^63
-        return @as(i64, @intFromFloat(t)) == i;
+    /// Order of `d` versus `i`, matching cel-go's `compareDoubleInt`: when
+    /// the double is within the int64 range (compared through the double
+    /// representation of the bounds), the int is cast to double (lossy at
+    /// the extremes, per the conformance suite's "lossy" tests).
+    fn doubleIntOrder(d: f64, i: i64) std.math.Order {
+        if (d < -9223372036854775808.0) return .lt; // d < minInt
+        if (d > 9223372036854775808.0) return .gt; // d > (double)maxInt == 2^63
+        return std.math.order(d, @as(f64, @floatFromInt(i)));
     }
 
-    /// Exact equality between a u64 and an f64 on the number line.
-    fn uintDoubleEql(u: u64, d: f64) bool {
-        if (std.math.isNan(d) or std.math.isInf(d)) return false;
-        const t = @trunc(d);
-        if (t != d) return false;
-        if (t >= 18446744073709551616.0) return false; // >= 2^64
-        if (t < 0) return false;
-        return @as(u64, @intFromFloat(t)) == u;
+    /// Order of `d` versus `u` (cel-go's `compareDoubleUint`).
+    fn doubleUintOrder(d: f64, u: u64) std.math.Order {
+        if (d < 0) return .lt;
+        if (d > 18446744073709551616.0) return .gt; // d > (double)maxUint == 2^64
+        return std.math.order(d, @as(f64, @floatFromInt(u)));
     }
 
     fn numericEql(a: Value, b: Value) bool {
+        // NaN compares unequal to everything (checked first, since the
+        // range checks in the cross-type orders would otherwise treat a NaN
+        // as "in range" and compare it as equal to its cast).
+        if (a == .double_t and std.math.isNan(a.double_t)) return false;
+        if (b == .double_t and std.math.isNan(b.double_t)) return false;
         switch (a) {
             .int_t => |i| switch (b) {
                 .int_t => |j| return i == j,
                 .uint_t => |u| return i >= 0 and @as(u64, @bitCast(i)) == u,
-                .double_t => |d| return intDoubleEql(i, d),
+                .double_t => |d| return doubleIntOrder(d, i) == .eq,
                 else => unreachable,
             },
             .uint_t => |u| switch (b) {
                 .int_t => |i| return i >= 0 and @as(u64, @bitCast(i)) == u,
                 .uint_t => |v| return u == v,
-                .double_t => |d| return uintDoubleEql(u, d),
+                .double_t => |d| return doubleUintOrder(d, u) == .eq,
                 else => unreachable,
             },
             .double_t => |d| switch (b) {
-                .int_t => |i| return intDoubleEql(i, d),
-                .uint_t => |u| return uintDoubleEql(u, d),
-                .double_t => |e| return d == e, // NaN != NaN
+                .int_t => |i| return doubleIntOrder(d, i) == .eq,
+                .uint_t => |u| return doubleUintOrder(d, u) == .eq,
+                .double_t => |e| return d == e,
                 else => unreachable,
             },
             else => unreachable,
@@ -294,7 +296,7 @@ pub const Value = union(enum) {
                     if (i < 0) return .lt;
                     return std.math.order(@as(u64, @bitCast(i)), u);
                 },
-                .double_t => |d| return intDoubleCompare(i, d),
+                .double_t => |d| return invert(doubleIntOrder(d, i)),
                 else => unreachable,
             },
             .uint_t => |u| switch (b) {
@@ -303,12 +305,12 @@ pub const Value = union(enum) {
                     return std.math.order(u, @as(u64, @bitCast(i)));
                 },
                 .uint_t => |v| return std.math.order(u, v),
-                .double_t => |d| return uintDoubleCompare(u, d),
+                .double_t => |d| return invert(doubleUintOrder(d, u)),
                 else => unreachable,
             },
             .double_t => |d| switch (b) {
-                .int_t => |i| return invert(intDoubleCompare(i, d)),
-                .uint_t => |u| return invert(uintDoubleCompare(u, d)),
+                .int_t => |i| return doubleIntOrder(d, i),
+                .uint_t => |u| return doubleUintOrder(d, u),
                 .double_t => |e| {
                     if (std.math.isNan(d) or std.math.isNan(e)) return null;
                     return std.math.order(d, e);
@@ -327,31 +329,6 @@ pub const Value = union(enum) {
         } else null;
     }
 
-    fn intDoubleCompare(i: i64, d: f64) ?std.math.Order {
-        if (std.math.isNan(d)) return null;
-        if (std.math.isInf(d)) return if (d > 0) .lt else .gt;
-        const t = @trunc(d);
-        if (t >= 9223372036854775808.0) return .lt; // i < 2^63 <= t
-        if (t < -9223372036854775808.0) return .gt; // i >= -2^63 > t
-        const ti: i64 = @intFromFloat(t);
-        if (i < ti) return .lt;
-        if (i > ti) return .gt;
-        // i == t; fractional part of d decides.
-        return if (d > t) .lt else .eq;
-    }
-
-    fn uintDoubleCompare(u: u64, d: f64) ?std.math.Order {
-        if (std.math.isNan(d)) return null;
-        if (std.math.isInf(d)) return if (d > 0) .lt else .gt;
-        const t = @trunc(d);
-        if (t >= 18446744073709551616.0) return .lt; // u < 2^64 <= t
-        if (t < 0) return .gt;
-        const tu: u64 = @intFromFloat(t);
-        if (u < tu) return .lt;
-        if (u > tu) return .gt;
-        return if (d > t) .lt else .eq;
-    }
-
     // ---- hashing (consistent with eql) ----
 
     /// Hash a value such that equal values (per `eql`) hash equally. Numeric
@@ -363,22 +340,11 @@ pub const Value = union(enum) {
         switch (v) {
             .null_t => return 0x01,
             .bool_t => |b| return hashMix(0x02, @intFromBool(b)),
-            .int_t => |i| {
-                if (i >= -(1 << 53) and i <= (1 << 53)) return hashDouble(@floatFromInt(i));
-                const d: f64 = @floatFromInt(i);
-                // If i is exactly representable as a double, hash as the
-                // double so that (int i) == (double d) implies equal hashes.
-                if (d >= -9223372036854775808.0 and d < 9223372036854775808.0) {
-                    if (@as(i64, @intFromFloat(d)) == i) return hashDouble(d);
-                }
-                return hashMix(0x03, @bitCast(i));
-            },
-            .uint_t => |u| {
-                if (u <= (1 << 53)) return hashDouble(@floatFromInt(u));
-                const d: f64 = @floatFromInt(u);
-                if (@as(u64, @intFromFloat(d)) == u) return hashDouble(d);
-                return hashMix(0x04, u);
-            },
+            // Numeric values hash as their double cast: heterogeneous
+            // equality uses the (possibly lossy) int->double conversion, so
+            // equal values must hash equally.
+            .int_t => |i| return hashDouble(@floatFromInt(i)),
+            .uint_t => |u| return hashDouble(@floatFromInt(u)),
             .double_t => |d| return hashDouble(d),
             .string_t => |s| return std.hash.Wyhash.hash(0xCE1, s),
             .bytes_t => |s| return std.hash.Wyhash.hash(0xCEB, s),
@@ -504,7 +470,10 @@ test "numeric equality" {
     try t.expect(Value.eql(.{ .double_t = 0.0 }, .{ .double_t = -0.0 }));
     // Exact large-number comparisons.
     try t.expect(Value.eql(.{ .int_t = 1 << 53 }, .{ .double_t = 9007199254740992.0 }));
-    try t.expect(!Value.eql(.{ .int_t = (1 << 53) + 1 }, .{ .double_t = 9007199254740992.0 }));
+    // Cross-type equality casts the int to double (lossy at the extremes),
+    // matching cel-go and the conformance suite.
+    try t.expect(Value.eql(.{ .int_t = (1 << 53) + 1 }, .{ .double_t = 9007199254740992.0 }));
+    try t.expect(Value.eql(.{ .int_t = std.math.maxInt(i64) }, .{ .double_t = 9223372036854775808.0 }));
     try t.expect(Value.eql(.{ .int_t = (1 << 53) + 2 }, .{ .double_t = 9007199254740994.0 }));
     try t.expect(Value.eql(.{ .int_t = -5 }, .{ .double_t = -5.0 }));
     try t.expect(!Value.eql(.{ .int_t = 5 }, .{ .double_t = 5.5 }));

@@ -352,9 +352,6 @@ pub const Parser = struct {
                         }
                         continue;
                     }
-                    if (ft.is_reserved) {
-                        return p.fail(ft.start, "reserved word cannot be used as a field name");
-                    }
                     const sel = try p.addNode(.{ .kind = .select, .start = t.start, .payload = .{ .str = ft.text } });
                     try p.setChildren(sel, &.{e});
                     e = sel;
@@ -532,6 +529,11 @@ pub const Parser = struct {
             }
         }
 
+        // A message construction with a simple type name: `M{f: v}`.
+        if (p.cur().kind == .lbrace) {
+            return p.parseStructLiteral(segments.items, abs, first.start);
+        }
+
         if (segments.items.len == 1) {
             const n = try p.addNode(.{ .kind = .ident, .start = first.start, .payload = .{ .str = segments.items[0] } });
             if (abs) p.nodes.items[n].flags.abs = true;
@@ -624,7 +626,6 @@ pub const Parser = struct {
             while (true) {
                 const ft = p.cur();
                 if (ft.kind != .ident) return p.fail(ft.start, "expected field name in message literal");
-                if (ft.is_reserved) return p.fail(ft.start, "reserved word cannot be used as a field name");
                 p.advance();
                 _ = try p.expect(.colon, "expected ':' after field name");
                 const v = try p.parseExpr();
@@ -793,9 +794,12 @@ const tests = struct {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         try expectErr("as");
-        try expectErr("a.while");
+        // Reserved words are permitted as selectors and struct field names
+        // (parse.textproto); they are rejected as plain identifiers and
+        // struct type names.
+        _ = try parseOk(&arena, "a.while");
+        _ = try parseOk(&arena, "M{package: 1}");
         try expectErr("while{f: 1}");
-        try expectErr("M{package: 1}");
         // Receiver-call style with reserved word is allowed.
         const a = try parseOk(&arena, "a.package(1)");
         try testing.expectEqual(ast.Kind.call, kindOf(a, a.root));

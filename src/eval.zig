@@ -37,6 +37,9 @@ pub const Evaluator = struct {
     alloc: std.mem.Allocator,
     tree: ast.Ast,
     vars: []const Binding = &.{},
+    /// Optional protobuf package container for name resolution (conformance
+    /// `container`); qualified names are resolved against its prefixes.
+    container: []const u8 = "",
     scopes: std.ArrayList(Scope) = .empty,
     err_msg: []const u8 = "",
     /// Set when the current error is an unbound-name error; used by select
@@ -160,16 +163,19 @@ pub const Evaluator = struct {
 
     // ---- identifiers and selection ----
 
-    fn lookupVar(ev: *Evaluator, name: []const u8) ?Value {
+    /// Look up a name in comprehension scopes only.
+    fn lookupScope(ev: *Evaluator, name: []const u8) ?Value {
         var i = ev.scopes.items.len;
         while (i > 0) {
             i -= 1;
             if (std.mem.eql(u8, ev.scopes.items[i].name, name)) return ev.scopes.items[i].value;
         }
-        for (ev.vars) |v| {
-            if (std.mem.eql(u8, v.name, name)) return v.value;
-        }
         return null;
+    }
+
+    fn lookupVar(ev: *Evaluator, name: []const u8) ?Value {
+        if (ev.lookupScope(name)) |v| return v;
+        return ev.lookupTopLevel(name);
     }
 
     /// Type names usable as bare identifier denotations. `dyn`,
@@ -193,30 +199,70 @@ pub const Evaluator = struct {
         return null;
     }
 
+    /// Iterate the container prefixes for name resolution, longest first,
+    /// ending with the empty prefix (bare name).
+    fn containerPrefixes(container: []const u8, buf: *std.ArrayList([]const u8), alloc: std.mem.Allocator) Error!void {
+        if (container.len > 0) {
+            var end = container.len;
+            while (true) {
+                try buf.append(alloc, container[0..end]);
+                const dot = std.mem.lastIndexOfScalar(u8, container[0..end], '.') orelse break;
+                end = dot;
+            }
+        }
+        try buf.append(alloc, "");
+    }
+
+    /// Look up a name in the top-level bindings only (no comprehension
+    /// scopes, no container).
+    fn lookupTopLevel(ev: *Evaluator, name: []const u8) ?Value {
+        for (ev.vars) |v| {
+            if (std.mem.eql(u8, v.name, name)) return v.value;
+        }
+        return null;
+    }
+
     fn evalIdent(ev: *Evaluator, node: ast.NodeIndex) Error!Value {
         const n = ev.tree.nodes[node];
-        if (!n.flags.abs) {
-            if (ev.lookupVar(n.payload.str)) |v| return v;
-        } else if (ev.lookupVar(n.payload.str)) |v| {
-            // Absolute names bypass comprehension scopes but still see
-            // top-level bindings? No: `.a` resolves only in the root scope,
-            // which for us is the top-level bindings.
-            return v;
+        if (n.flags.abs) {
+            // Absolute names (`.y`) resolve only in the root scope,
+            // bypassing comprehension scopes and the container.
+            if (ev.lookupTopLevel(n.payload.str)) |v| return v;
+        } else {
+            // Comprehension scopes shadow outer names.
+            if (ev.lookupScope(n.payload.str)) |v| return v;
+            // Container-qualified resolution takes precedence over the bare
+            // name (namespace.textproto: self_eval_container_lookup).
+            if (ev.container.len > 0) {
+                var prefixes = std.ArrayList([]const u8){};
+                defer prefixes.deinit(ev.alloc);
+                try containerPrefixes(ev.container, &prefixes, ev.alloc);
+                for (prefixes.items) |pfx| {
+                    if (pfx.len == 0) break;
+                    const q = std.fmt.allocPrint(ev.alloc, "{s}.{s}", .{ pfx, n.payload.str }) catch return error.OutOfMemory;
+                    if (ev.lookupTopLevel(q)) |v| return v;
+                }
+            }
+            if (ev.lookupTopLevel(n.payload.str)) |v| return v;
         }
         if (bareTypeDenotation(n.payload.str)) |t| return .{ .type_t = t };
         return ev.failUnbound(n.payload.str);
     }
 
+    const QualifiedName = struct { name: []const u8, abs: bool };
+
     /// Collect the dotted name of a pure select chain rooted at an ident,
     /// e.g. `google.protobuf.Timestamp`. Returns null for anything else.
-    fn qualifiedName(ev: *Evaluator, node: ast.NodeIndex) ?[]const u8 {
+    fn qualifiedName(ev: *Evaluator, node: ast.NodeIndex) ?QualifiedName {
         var parts = std.ArrayList([]const u8){};
         defer parts.deinit(ev.alloc);
+        var abs = false;
         var cur = node;
         while (true) {
             const n = ev.tree.nodes[cur];
             switch (n.kind) {
                 .ident => {
+                    abs = n.flags.abs;
                     parts.append(ev.alloc, n.payload.str) catch return null;
                     break;
                 },
@@ -235,7 +281,8 @@ pub const Evaluator = struct {
             if (i > 0) out.append(ev.alloc, '.') catch return null;
             out.appendSlice(ev.alloc, p) catch return null;
         }
-        return out.toOwnedSlice(ev.alloc) catch null;
+        const name = out.toOwnedSlice(ev.alloc) catch return null;
+        return .{ .name = name, .abs = abs };
     }
 
     fn evalSelect(ev: *Evaluator, node: ast.NodeIndex) Error!Value {
@@ -244,12 +291,29 @@ pub const Evaluator = struct {
         const operand = ev.eval(operand_node) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Eval => {
-                // A select chain rooted at an unbound name may be a
-                // well-known type denotation (google.protobuf.Timestamp).
+                // A select chain rooted at an unbound name may resolve as a
+                // qualified variable binding or a well-known type denotation
+                // (google.protobuf.Timestamp), possibly container-qualified.
                 if (ev.unbound) {
-                    if (ev.qualifiedName(node)) |qname| {
-                        if (value_mod.Type.fromName(qname)) |t| {
-                            return .{ .type_t = t };
+                    if (ev.qualifiedName(node)) |q| {
+                        // Absolute names (`.a.b`) resolve only in the root
+                        // scope; others try the container prefixes first.
+                        var prefixes = std.ArrayList([]const u8){};
+                        defer prefixes.deinit(ev.alloc);
+                        if (q.abs) {
+                            try prefixes.append(ev.alloc, "");
+                        } else {
+                            try containerPrefixes(ev.container, &prefixes, ev.alloc);
+                        }
+                        for (prefixes.items) |pfx| {
+                            const candidate = if (pfx.len == 0) q.name else std.fmt.allocPrint(ev.alloc, "{s}.{s}", .{ pfx, q.name }) catch return error.OutOfMemory;
+                            if (ev.lookupTopLevel(candidate)) |v| return v;
+                        }
+                        for (prefixes.items) |pfx| {
+                            const candidate = if (pfx.len == 0) q.name else std.fmt.allocPrint(ev.alloc, "{s}.{s}", .{ pfx, q.name }) catch return error.OutOfMemory;
+                            if (value_mod.Type.fromName(candidate)) |t| {
+                                return .{ .type_t = t };
+                            }
                         }
                     }
                 }
@@ -303,29 +367,27 @@ pub const Evaluator = struct {
             .and_op => false, // `false && x` = false
             .or_op => true, // `true || x` = true
         };
+        const fn_name = if (op == .and_op) "_&&_" else "_||_";
         const lhs = try ev.tryEval(lhs_node);
         if (lhs) |v| {
-            switch (v) {
-                .bool_t => |b| {
-                    if (b == absorbing) return .{ .bool_t = absorbing };
-                },
-                else => return ev.noOverload(if (op == .and_op) "_&&_" else "_||_", &.{v}),
-            }
+            if (v == .bool_t and v.bool_t == absorbing) return .{ .bool_t = absorbing };
         }
         const rhs = try ev.tryEval(rhs_node);
         if (rhs) |v| {
-            switch (v) {
-                .bool_t => |b| {
-                    if (b == absorbing) return .{ .bool_t = absorbing };
-                    // rhs is non-absorbing: result is lhs if lhs was a bool.
-                    if (lhs != null) return .{ .bool_t = !absorbing };
-                    // lhs errored: error && true -> error; error || false -> error
-                    return ev.fail("{s}", .{if (ev.err_msg.len > 0) ev.err_msg else "evaluation error"});
-                },
-                else => return ev.noOverload(if (op == .and_op) "_&&_" else "_||_", &.{v}),
-            }
+            if (v == .bool_t and v.bool_t == absorbing) return .{ .bool_t = absorbing };
         }
-        // Both errored (or rhs errored): propagate.
+        // Neither operand determined the result: any error or non-bool
+        // operand is now a hard failure.
+        if (lhs) |v| {
+            if (v != .bool_t) return ev.noOverload(fn_name, &.{v});
+        }
+        if (rhs) |v| {
+            if (v != .bool_t) return ev.noOverload(fn_name, &.{v});
+        }
+        if (lhs != null and rhs != null) {
+            // Both bools, neither absorbing: true && true, false || false.
+            return .{ .bool_t = !absorbing };
+        }
         return ev.fail("{s}", .{if (ev.err_msg.len > 0) ev.err_msg else "evaluation error"});
     }
 
@@ -730,7 +792,8 @@ pub const Evaluator = struct {
             .double_t => |d| {
                 if (std.math.isNan(d)) return ev.rangeErr("int", "NaN");
                 const t = @trunc(d);
-                if (t >= 9223372036854775808.0 or t < -9223372036854775808.0) return ev.rangeErr("int", "double value out of range");
+                // The range is (minInt, maxInt) non-inclusive at both ends.
+                if (t >= 9223372036854775808.0 or t <= -9223372036854775808.0) return ev.rangeErr("int", "double value out of range");
                 return .{ .int_t = @intFromFloat(t) };
             },
             .string_t => |s| return ev.parseIntStr(s, i64, "int"),
@@ -846,6 +909,12 @@ pub const Evaluator = struct {
     fn toTimestamp(ev: *Evaluator, v: Value) Error!Value {
         switch (v) {
             .timestamp_t => return v,
+            .int_t => |i| {
+                if (i < time.Timestamp.min_seconds or i > time.Timestamp.max_seconds) {
+                    return ev.rangeErr("timestamp", "seconds out of range");
+                }
+                return .{ .timestamp_t = .{ .seconds = i, .nanos = 0 } };
+            },
             .string_t => |s| {
                 const t = time.parseTimestamp(s) catch return ev.convErr("timestamp", "invalid timestamp string");
                 return .{ .timestamp_t = t };

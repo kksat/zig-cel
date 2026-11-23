@@ -34,7 +34,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
 
-    // Conformance suite (runs against vendored cel-spec testdata).
+    // Conformance suite (runs against vendored cel-spec testdata). The test
+    // target executes the full suite; the executable can be run directly
+    // (e.g. with -v for per-test skip/failure notes).
     const conf_mod = b.createModule(.{
         .root_source_file = b.path("conformance/main.zig"),
         .target = target,
@@ -43,9 +45,12 @@ pub fn build(b: *std.Build) void {
     conf_mod.addImport("cel", lib_mod);
     const conf_tests = b.addTest(.{ .root_module = conf_mod });
     const run_conf = b.addRunArtifact(conf_tests);
-    const conf_step = b.step("conformance", "Run CEL conformance suite");
-    conf_step.dependOn(&run_conf.step);
     test_step.dependOn(&run_conf.step);
+    const conf_exe = b.addExecutable(.{ .name = "cel-conformance", .root_module = conf_mod });
+    const install_conf = b.addInstallArtifact(conf_exe, .{});
+    const conf_step = b.step("conformance", "Run CEL conformance suite");
+    conf_step.dependOn(&install_conf.step);
+    conf_step.dependOn(&run_conf.step);
 
     // Benchmarks (latency + memory).
     const bench_mod = b.createModule(.{

@@ -371,15 +371,16 @@ pub const TimeZone = struct {
     pub fn resolve(name: []const u8, ts_seconds: i64) Error!TimeZone {
         if (name.len == 0) return error.Parse;
         if (std.mem.eql(u8, name, "UTC")) return .{ .offset_secs = 0 };
-        // Fixed offset ±HH:MM.
-        if (name[0] == '+' or name[0] == '-') {
-            var i: usize = 1;
+        // Fixed offset ±HH:MM (sign optional).
+        if (name[0] == '+' or name[0] == '-' or (name.len == 5 and name[2] == ':')) {
+            const has_sign = name[0] == '+' or name[0] == '-';
+            var i: usize = if (has_sign) 1 else 0;
             const hh = try parseDigits(name, &i, 2);
             if (name[i] != ':') return error.Parse;
             i += 1;
             const mm = try parseDigits(name, &i, 2);
             if (i != name.len or hh > 23 or mm > 59) return error.Parse;
-            const sign: i64 = if (name[0] == '+') 1 else -1;
+            const sign: i64 = if (!has_sign or name[0] == '+') 1 else -1;
             return .{ .offset_secs = sign * (@as(i64, hh) * 3600 + @as(i64, mm) * 60) };
         }
         // Named zones (subset with DST rules accurate for modern dates).
