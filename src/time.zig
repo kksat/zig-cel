@@ -57,10 +57,10 @@ pub fn dayOfWeek(days: i64) u32 {
     return @intCast(@mod(days + 4, 7));
 }
 
-/// Day of year, 0-based.
+/// Day of year, 0-based (Jan 1 is day 0).
 pub fn dayOfYear(days: i64) i64 {
     const c = civilFromDays(days);
-    return days - daysFromCivil(c.year, c.month, 1);
+    return days - daysFromCivil(c.year, 1, 1);
 }
 
 // ---- timestamp ----
