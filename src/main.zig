@@ -15,7 +15,8 @@ const value_mod = cel.value;
 
 const Value = value_mod.Value;
 
-fn parseBindingValue(alloc: std.mem.Allocator, text: []const u8) !Value {    // Parse the value text as a CEL expression and evaluate it with no
+fn parseBindingValue(alloc: std.mem.Allocator, text: []const u8) !Value {
+    // Parse the value text as a CEL expression and evaluate it with no
     // bindings; the result must be a value literal.
     const r = try parser.parseSrc(alloc, text, .{});
     const tree = switch (r) {
@@ -88,10 +89,16 @@ pub fn main() !void {
             std.process.exit(1);
         },
     };
-    var ev = eval.Evaluator.init(a, tree);
-    const v = ev.run(bindings.items) catch {
-        std.debug.print("error: {s}\n", .{ev.err_msg});
+    const prog = cel.vm.Compiler.compile(a, tree) catch {
+        std.debug.print("compile error\n", .{});
         std.process.exit(1);
+    };
+    const v = switch (try prog.run(a, bindings.items, "")) {
+        .value => |v| v,
+        .err => |e| {
+            std.debug.print("error: {s}\n", .{e});
+            std.process.exit(1);
+        },
     };
 
     var aw = std.Io.Writer.Allocating.init(a);

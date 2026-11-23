@@ -547,7 +547,13 @@ const CodeGen = struct {
 // ---- compiled regex + Pike VM ----
 
 pub const Regex = struct {
+    pattern: []const u8 = "",
     prog: []Inst,
+    /// Allocator that owns this regex (for the lazy Pike-VM scratch).
+    owner: ?std.mem.Allocator = null,
+    /// Lazily allocated simulation scratch, reused across matches. Makes
+    /// `matches` non-thread-safe per Regex (compile one per thread).
+    scratch: ?*Scratch = null,
 
     /// Compile a pattern. The program is allocated in `alloc`.
     pub fn compile(alloc: std.mem.Allocator, pattern: []const u8) Error!Regex {
@@ -572,48 +578,88 @@ pub const Regex = struct {
         try g.gen(root);
         _ = try g.emit(.{ .match = {} });
         const prog = try alloc.realloc(g.prog, g.len);
-        return .{ .prog = prog };
+        return .{ .pattern = pattern, .prog = prog, .owner = alloc };
     }
 
     pub fn deinit(r: *Regex, alloc: std.mem.Allocator) void {
         alloc.free(r.prog);
+        if (r.scratch) |s| {
+            if (r.owner) |o| {
+                o.free(s.dense[0]);
+                o.free(s.seen[0]);
+                o.free(s.dense[1]);
+                o.free(s.seen[1]);
+                o.destroy(s);
+            }
+        }
+        r.scratch = null;
+    }
+
+    /// Pike-VM scratch: two thread lists with generation-stamped `seen`
+    /// arrays (no clearing between steps), swapped by index.
+    pub const Scratch = struct {
+        dense: [2][]u32,
+        seen: [2][]u32,
+        gen: [2]u32,
+        count: [2]usize,
+        cur: usize,
+    };
+
+    fn ensureScratch(r: *Regex) Error!void {
+        if (r.scratch != null) return;
+        const alloc = r.owner orelse return error.OutOfMemory;
+        const s = try alloc.create(Scratch);
+        errdefer alloc.destroy(s);
+        const n = r.prog.len;
+        s.* = .{
+            .dense = .{ try alloc.alloc(u32, n), try alloc.alloc(u32, n) },
+            .seen = .{ try alloc.alloc(u32, n), try alloc.alloc(u32, n) },
+            .gen = .{ 1, 1 },
+            .count = .{ 0, 0 },
+            .cur = 0,
+        };
+        @memset(s.seen[0], 0);
+        @memset(s.seen[1], 0);
+        r.scratch = s;
     }
 
     /// Report whether the regex matches anywhere in `input`.
-    pub fn matches(r: *const Regex, input: []const u8) bool {
+    pub fn matches(r: *Regex, input: []const u8) bool {
         if (r.prog.len == 0) return false;
-        var clist = ThreadList.init();
-        var nlist = ThreadList.init();
-        addThread(r.prog, &clist, 0, input, 0);
+        r.ensureScratch() catch return false;
+        const s = r.scratch.?;
+        var a = s.cur;
+        s.gen[a] +%= 1;
+        s.count[a] = 0;
+        addThread(r, s, a, 0, input, 0);
         var sp: usize = 0;
         while (true) {
-            // Check for match among current threads.
-            for (clist.dense[0..clist.count]) |pc| {
+            const count = s.count[a];
+            const dense = s.dense[a];
+            for (dense[0..count]) |pc| {
                 if (r.prog[pc] == .match) return true;
             }
-            if (sp >= input.len or clist.count == 0) return false;
+            if (sp >= input.len or count == 0) return false;
             const c = input[sp];
-            nlist.clear(r.prog);
-            for (clist.dense[0..clist.count]) |pc| {
+            const b = 1 - a;
+            s.gen[b] +%= 1;
+            s.count[b] = 0;
+            for (dense[0..count]) |pc| {
                 switch (r.prog[pc]) {
                     .char => |cc| {
                         if (bitsetHas(cc.set, c) or (cc.any_high and c >= 0x80)) {
-                            addThread(r.prog, &nlist, pc + 1, input, sp + 1);
+                            addThread(r, s, b, pc + 1, input, sp + 1);
                         }
                     },
                     .range => |br| {
                         if (c >= br.lo and c <= br.hi) {
-                            addThread(r.prog, &nlist, pc + 1, input, sp + 1);
+                            addThread(r, s, b, pc + 1, input, sp + 1);
                         }
                     },
                     else => {},
                 }
             }
-            // Swap lists; clear the old one (now nlist) for reuse.
-            const tmp = clist;
-            clist = nlist;
-            nlist = tmp;
-            nlist.clear(r.prog);
+            a = b;
             sp += 1;
         }
     }
@@ -623,7 +669,7 @@ pub const Regex = struct {
     }
 
     /// Epsilon closure with an explicit stack (bounded by program size).
-    fn addThread(prog: []const Inst, list: *ThreadList, pc_in: u32, input: []const u8, pos: usize) void {
+    fn addThread(r: *Regex, s: *Scratch, list: usize, pc_in: u32, input: []const u8, pos: usize) void {
         var stack: [512]u32 = undefined;
         var depth: usize = 0;
         stack[depth] = pc_in;
@@ -631,24 +677,24 @@ pub const Regex = struct {
         while (depth > 0) {
             depth -= 1;
             const pc = stack[depth];
-            if (list.seen[pc]) continue;
-            list.seen[pc] = true;
-            list.dense[list.count] = pc;
-            list.count += 1;
-            switch (prog[pc]) {
+            if (s.seen[list][pc] == s.gen[list]) continue;
+            s.seen[list][pc] = s.gen[list];
+            s.dense[list][s.count[list]] = pc;
+            s.count[list] += 1;
+            switch (r.prog[pc]) {
                 .jmp => |t| {
                     if (depth < stack.len) {
                         stack[depth] = t;
                         depth += 1;
                     }
                 },
-                .split => |s| {
+                .split => |sp2| {
                     if (depth < stack.len) {
-                        stack[depth] = s.b;
+                        stack[depth] = sp2.b;
                         depth += 1;
                     }
                     if (depth < stack.len) {
-                        stack[depth] = s.a;
+                        stack[depth] = sp2.a;
                         depth += 1;
                     }
                 },
@@ -676,24 +722,6 @@ pub const Regex = struct {
                 else => {},
             }
         }
-    }
-};
-
-const ThreadList = struct {
-    dense: [max_program]u32,
-    seen: [max_program]bool,
-    count: usize,
-
-    fn init() ThreadList {
-        return .{ .dense = undefined, .seen = [_]bool{false} ** max_program, .count = 0 };
-    }
-
-    fn clear(l: *ThreadList, prog: []const Inst) void {
-        for (l.dense[0..l.count]) |pc| {
-            _ = prog;
-            l.seen[pc] = false;
-        }
-        l.count = 0;
     }
 };
 

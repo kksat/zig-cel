@@ -179,17 +179,27 @@ fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: 
         }
     }
 
-    // Evaluate.
-    var ev = eval.Evaluator.init(a, tree);
-    ev.container = t.container;
-    const result = ev.run(bindings.items);
+    // Compile and evaluate.
+    const prog = cel.vm.Compiler.compile(a, tree) catch {
+        stats.failed += 1;
+        std.debug.print("FAIL {s}: compile error\n  expr: {s}\n", .{ label, t.expr });
+        return;
+    };
+    const result = prog.run(a, bindings.items, t.container) catch {
+        stats.failed += 1;
+        std.debug.print("FAIL {s}: out of memory\n  expr: {s}\n", .{ label, t.expr });
+        return;
+    };
 
     switch (t.result) {
         .value => |expected| {
-            const actual = result catch {
-                stats.failed += 1;
-                std.debug.print("FAIL {s}: eval error: {s}\n  expr: {s}\n", .{ label, ev.err_msg, t.expr });
-                return;
+            const actual = switch (result) {
+                .value => |v| v,
+                .err => |e| {
+                    stats.failed += 1;
+                    std.debug.print("FAIL {s}: eval error: {s}\n  expr: {s}\n", .{ label, e, t.expr });
+                    return;
+                },
             };
             const want = toValue(a, expected);
             if (!valuesEqual(actual, want)) {
@@ -202,30 +212,36 @@ fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: 
             stats.passed += 1;
         },
         .eval_error => |expected_msgs| {
-            const actual = result catch {
-                // Error produced; check messages (soft).
-                var matched = expected_msgs.len == 0;
-                for (expected_msgs) |m| {
-                    if (messageMatches(m, ev.err_msg)) matched = true;
-                }
-                if (!matched) {
-                    stats.msg_mismatches += 1;
-                    if (verbose) std.debug.print("NOTE {s}: error message mismatch (non-fatal)\n  expr: {s}\n  want: {s}\n  got:  {s}\n", .{ label, t.expr, concat(a, expected_msgs), ev.err_msg });
-                }
-                stats.passed += 1;
-                return;
-            };
-            stats.failed += 1;
-            std.debug.print("FAIL {s}: expected error, got value: {s}\n  expr: {s}\n", .{ label, displayOf(a, actual), t.expr });
+            switch (result) {
+                .err => |actual| {
+                    // Error produced; check messages (soft).
+                    var matched = expected_msgs.len == 0;
+                    for (expected_msgs) |m| {
+                        if (messageMatches(m, actual)) matched = true;
+                    }
+                    if (!matched) {
+                        stats.msg_mismatches += 1;
+                        if (verbose) std.debug.print("NOTE {s}: error message mismatch (non-fatal)\n  expr: {s}\n  want: {s}\n  got:  {s}\n", .{ label, t.expr, concat(a, expected_msgs), actual });
+                    }
+                    stats.passed += 1;
+                },
+                .value => |actual| {
+                    stats.failed += 1;
+                    std.debug.print("FAIL {s}: expected error, got value: {s}\n  expr: {s}\n", .{ label, displayOf(a, actual), t.expr });
+                },
+            }
         },
         .unknown => {
             stats.skipped += 1;
         },
         .default_true => {
-            const actual = result catch {
-                stats.failed += 1;
-                std.debug.print("FAIL {s}: expected true, got error: {s}\n  expr: {s}\n", .{ label, ev.err_msg, t.expr });
-                return;
+            const actual = switch (result) {
+                .value => |v| v,
+                .err => |e| {
+                    stats.failed += 1;
+                    std.debug.print("FAIL {s}: expected true, got error: {s}\n  expr: {s}\n", .{ label, e, t.expr });
+                    return;
+                },
             };
             if (actual != .bool_t or !actual.bool_t) {
                 stats.failed += 1;

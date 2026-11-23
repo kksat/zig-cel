@@ -15,18 +15,14 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const value_mod = @import("value.zig");
-const time = @import("time.zig");
-const regex = @import("regex.zig");
+const stdlib = @import("stdlib.zig");
 
 pub const Value = value_mod.Value;
 pub const Map = value_mod.Map;
 
 pub const Error = error{ Eval, OutOfMemory };
 
-pub const Binding = struct {
-    name: []const u8,
-    value: Value,
-};
+pub const Binding = stdlib.Binding;
 
 const Scope = struct {
     name: []const u8,
@@ -41,15 +37,12 @@ pub const Evaluator = struct {
     /// `container`); qualified names are resolved against its prefixes.
     container: []const u8 = "",
     scopes: std.ArrayList(Scope) = .empty,
-    err_msg: []const u8 = "",
-    /// Set when the current error is an unbound-name error; used by select
-    /// chains to attempt qualified type-name resolution.
-    unbound: bool = false,
+    ctx: stdlib.Ctx,
 
     const e = Evaluator;
 
     pub fn init(alloc: std.mem.Allocator, tree: ast.Ast) Evaluator {
-        return .{ .alloc = alloc, .tree = tree };
+        return .{ .alloc = alloc, .tree = tree, .ctx = stdlib.Ctx.init(alloc) };
     }
 
     pub fn run(ev: *Evaluator, vars: []const Binding) Error!Value {
@@ -59,15 +52,11 @@ pub const Evaluator = struct {
     }
 
     fn fail(ev: *Evaluator, comptime fmt: []const u8, args: anytype) Error {
-        ev.err_msg = std.fmt.allocPrint(ev.alloc, fmt, args) catch "out of memory";
-        ev.unbound = false;
-        return error.Eval;
+        return ev.ctx.fail(fmt, args);
     }
 
     fn failUnbound(ev: *Evaluator, name: []const u8) Error {
-        ev.err_msg = std.fmt.allocPrint(ev.alloc, "unknown variable: undeclared reference to '{s}' (in container '')", .{name}) catch "out of memory";
-        ev.unbound = true;
-        return error.Eval;
+        return ev.ctx.failUnbound(name);
     }
 
     /// Evaluate, returning null instead of propagating Eval errors (used by
@@ -115,7 +104,7 @@ pub const Evaluator = struct {
                 const v = try ev.eval(ev.child(node));
                 switch (v) {
                     .bool_t => |b| return .{ .bool_t = !b },
-                    else => return ev.noOverload("!_", &.{v}),
+                    else => return ev.ctx.noOverload(.not, &.{v}),
                 }
             },
             .neg => {
@@ -126,7 +115,7 @@ pub const Evaluator = struct {
                         return .{ .int_t = -i };
                     },
                     .double_t => |d| return .{ .double_t = -d },
-                    else => return ev.noOverload("-_", &.{v}),
+                    else => return ev.ctx.noOverload(.neg, &.{v}),
                 }
             },
             .and_ => {
@@ -142,23 +131,11 @@ pub const Evaluator = struct {
                 const cond = try ev.eval(kids[0]);
                 switch (cond) {
                     .bool_t => |b| return ev.eval(if (b) kids[1] else kids[2]),
-                    else => return ev.noOverload("_?_:_", &.{cond}),
+                    else => return ev.ctx.noOverload(.ternary, &.{cond}),
                 }
             },
             .macro => return ev.evalMacro(node),
         }
-    }
-
-    fn noOverload(ev: *Evaluator, fn_name: []const u8, args: []const Value) Error {
-        var aw = std.Io.Writer.Allocating.init(ev.alloc);
-        const w = &aw.writer;
-        for (args, 0..) |a, i| {
-            if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-            w.writeAll(a.typeOf().name()) catch return error.OutOfMemory;
-        }
-        ev.err_msg = std.fmt.allocPrint(ev.alloc, "no_matching_overload: found no matching overload for '{s}' applied to '({s})'", .{ fn_name, aw.written() }) catch "out of memory";
-        ev.unbound = false;
-        return error.Eval;
     }
 
     // ---- identifiers and selection ----
@@ -178,23 +155,11 @@ pub const Evaluator = struct {
         return ev.lookupTopLevel(name);
     }
 
-    /// Type names usable as bare identifier denotations. `dyn`,
-    /// `duration`, and `timestamp` are functions, not denotations.
-    fn bareTypeDenotation(name: []const u8) ?value_mod.Type {
-        const map = .{
-            .{ "null_type", value_mod.Type.null_type },
-            .{ "bool", value_mod.Type.bool_ },
-            .{ "int", value_mod.Type.int_ },
-            .{ "uint", value_mod.Type.uint_ },
-            .{ "double", value_mod.Type.double_ },
-            .{ "string", value_mod.Type.string_ },
-            .{ "bytes", value_mod.Type.bytes_ },
-            .{ "list", value_mod.Type.list_ },
-            .{ "map", value_mod.Type.map_ },
-            .{ "type", value_mod.Type.type_ },
-        };
-        inline for (map) |entry| {
-            if (std.mem.eql(u8, entry[0], name)) return entry[1];
+    /// Look up a name in the top-level bindings only (no comprehension
+    /// scopes, no container).
+    fn lookupTopLevel(ev: *Evaluator, name: []const u8) ?Value {
+        for (ev.vars) |v| {
+            if (std.mem.eql(u8, v.name, name)) return v.value;
         }
         return null;
     }
@@ -211,15 +176,6 @@ pub const Evaluator = struct {
             }
         }
         try buf.append(alloc, "");
-    }
-
-    /// Look up a name in the top-level bindings only (no comprehension
-    /// scopes, no container).
-    fn lookupTopLevel(ev: *Evaluator, name: []const u8) ?Value {
-        for (ev.vars) |v| {
-            if (std.mem.eql(u8, v.name, name)) return v.value;
-        }
-        return null;
     }
 
     fn evalIdent(ev: *Evaluator, node: ast.NodeIndex) Error!Value {
@@ -245,7 +201,7 @@ pub const Evaluator = struct {
             }
             if (ev.lookupTopLevel(n.payload.str)) |v| return v;
         }
-        if (bareTypeDenotation(n.payload.str)) |t| return .{ .type_t = t };
+        if (stdlib.bareTypeDenotation(n.payload.str)) |t| return .{ .type_t = t };
         return ev.failUnbound(n.payload.str);
     }
 
@@ -294,7 +250,7 @@ pub const Evaluator = struct {
                 // A select chain rooted at an unbound name may resolve as a
                 // qualified variable binding or a well-known type denotation
                 // (google.protobuf.Timestamp), possibly container-qualified.
-                if (ev.unbound) {
+                if (ev.ctx.unbound) {
                     if (ev.qualifiedName(node)) |q| {
                         // Absolute names (`.a.b`) resolve only in the root
                         // scope; others try the container prefixes first.
@@ -367,7 +323,7 @@ pub const Evaluator = struct {
             .and_op => false, // `false && x` = false
             .or_op => true, // `true || x` = true
         };
-        const fn_name = if (op == .and_op) "_&&_" else "_||_";
+        const fn_id: stdlib.FnId = if (op == .and_op) .and_msg else .or_msg;
         const lhs = try ev.tryEval(lhs_node);
         if (lhs) |v| {
             if (v == .bool_t and v.bool_t == absorbing) return .{ .bool_t = absorbing };
@@ -379,16 +335,16 @@ pub const Evaluator = struct {
         // Neither operand determined the result: any error or non-bool
         // operand is now a hard failure.
         if (lhs) |v| {
-            if (v != .bool_t) return ev.noOverload(fn_name, &.{v});
+            if (v != .bool_t) return ev.ctx.noOverload(fn_id, &.{v});
         }
         if (rhs) |v| {
-            if (v != .bool_t) return ev.noOverload(fn_name, &.{v});
+            if (v != .bool_t) return ev.ctx.noOverload(fn_id, &.{v});
         }
         if (lhs != null and rhs != null) {
             // Both bools, neither absorbing: true && true, false || false.
             return .{ .bool_t = !absorbing };
         }
-        return ev.fail("{s}", .{if (ev.err_msg.len > 0) ev.err_msg else "evaluation error"});
+        return ev.fail("{s}", .{if (ev.ctx.err_msg.len > 0) ev.ctx.err_msg else "evaluation error"});
     }
 
     // ---- calls ----
@@ -404,602 +360,7 @@ pub const Evaluator = struct {
         for (kids) |k| {
             try args.append(ev.alloc, try ev.eval(k));
         }
-        return ev.dispatch(name, args.items);
-    }
-
-    fn dispatch(ev: *Evaluator, name: []const u8, args: []const Value) Error!Value {
-        // Operators.
-        if (std.mem.eql(u8, name, "_+_")) return ev.add(args);
-        if (std.mem.eql(u8, name, "_-_")) return ev.sub(args);
-        if (std.mem.eql(u8, name, "_*_")) return ev.mul(args);
-        if (std.mem.eql(u8, name, "_/_")) return ev.div(args);
-        if (std.mem.eql(u8, name, "_%_")) return ev.rem(args);
-        if (std.mem.eql(u8, name, "_==_")) return .{ .bool_t = Value.eql(args[0], args[1]) };
-        if (std.mem.eql(u8, name, "_!=_")) return .{ .bool_t = !Value.eql(args[0], args[1]) };
-        if (std.mem.eql(u8, name, "_<_") or std.mem.eql(u8, name, "_<=_") or
-            std.mem.eql(u8, name, "_>_") or std.mem.eql(u8, name, "_>=_"))
-        {
-            return ev.compare(name, args);
-        }
-        if (std.mem.eql(u8, name, "@in")) return ev.inOp(args);
-        if (std.mem.eql(u8, name, "_[_]")) return ev.index(args);
-        // Functions.
-        if (std.mem.eql(u8, name, "size")) return ev.size(args);
-        if (std.mem.eql(u8, name, "contains")) return ev.contains(args);
-        if (std.mem.eql(u8, name, "startsWith")) return ev.startsEndsWith(args, true);
-        if (std.mem.eql(u8, name, "endsWith")) return ev.startsEndsWith(args, false);
-        if (std.mem.eql(u8, name, "matches")) return ev.matches(args);
-        if (std.mem.eql(u8, name, "int")) return ev.toInt(args[0]);
-        if (std.mem.eql(u8, name, "uint")) return ev.toUint(args[0]);
-        if (std.mem.eql(u8, name, "double")) return ev.toDouble(args[0]);
-        if (std.mem.eql(u8, name, "string")) return ev.toString(args[0]);
-        if (std.mem.eql(u8, name, "bool")) return ev.toBool(args[0]);
-        if (std.mem.eql(u8, name, "bytes")) return ev.toBytes(args[0]);
-        if (std.mem.eql(u8, name, "type")) return .{ .type_t = args[0].typeOf() };
-        if (std.mem.eql(u8, name, "dyn")) return args[0];
-        if (std.mem.eql(u8, name, "duration")) return ev.toDuration(args[0]);
-        if (std.mem.eql(u8, name, "timestamp")) return ev.toTimestamp(args[0]);
-        if (std.mem.eql(u8, name, "getFullYear") or std.mem.eql(u8, name, "getMonth") or
-            std.mem.eql(u8, name, "getDate") or std.mem.eql(u8, name, "getDayOfMonth") or
-            std.mem.eql(u8, name, "getDayOfWeek") or std.mem.eql(u8, name, "getDayOfYear") or
-            std.mem.eql(u8, name, "getHours") or std.mem.eql(u8, name, "getMinutes") or
-            std.mem.eql(u8, name, "getSeconds") or std.mem.eql(u8, name, "getMilliseconds"))
-        {
-            return ev.getTimeField(name, args);
-        }
-        return ev.fail("unbound function: '{s}' is not defined", .{name});
-    }
-
-    // ---- arithmetic ----
-
-    fn add(ev: *Evaluator, args: []const Value) Error!Value {
-        const a = args[0];
-        const b = args[1];
-        switch (a) {
-            .int_t => |x| {
-                if (b != .int_t) return ev.noOverload("_+_", args);
-                const r = @addWithOverflow(x, b.int_t);
-                if (r[1] != 0) return ev.fail("return error for overflow: integer addition {d} + {d}", .{ x, b.int_t });
-                return .{ .int_t = r[0] };
-            },
-            .uint_t => |x| {
-                if (b != .uint_t) return ev.noOverload("_+_", args);
-                const r = @addWithOverflow(x, b.uint_t);
-                if (r[1] != 0) return ev.fail("return error for overflow: unsigned addition {d} + {d}", .{ x, b.uint_t });
-                return .{ .uint_t = r[0] };
-            },
-            .double_t => |x| {
-                if (b != .double_t) return ev.noOverload("_+_", args);
-                return .{ .double_t = x + b.double_t };
-            },
-            .string_t => |x| {
-                if (b != .string_t) return ev.noOverload("_+_", args);
-                const out = try ev.alloc.alloc(u8, x.len + b.string_t.len);
-                @memcpy(out[0..x.len], x);
-                @memcpy(out[x.len..], b.string_t);
-                return .{ .string_t = out };
-            },
-            .bytes_t => |x| {
-                if (b != .bytes_t) return ev.noOverload("_+_", args);
-                const out = try ev.alloc.alloc(u8, x.len + b.bytes_t.len);
-                @memcpy(out[0..x.len], x);
-                @memcpy(out[x.len..], b.bytes_t);
-                return .{ .bytes_t = out };
-            },
-            .list_t => |x| {
-                if (b != .list_t) return ev.noOverload("_+_", args);
-                const y = b.list_t;
-                const out = try ev.alloc.alloc(Value, x.len + y.len);
-                @memcpy(out[0..x.len], x);
-                @memcpy(out[x.len..], y);
-                return .{ .list_t = out };
-            },
-            .duration_t => |x| {
-                if (b == .duration_t) return ev.durationAdd(x, b.duration_t);
-                if (b == .timestamp_t) return ev.timestampAddDuration(b.timestamp_t, x);
-                return ev.noOverload("_+_", args);
-            },
-            .timestamp_t => |x| {
-                if (b == .duration_t) return ev.timestampAddDuration(x, b.duration_t);
-                return ev.noOverload("_+_", args);
-            },
-            else => return ev.noOverload("_+_", args),
-        }
-    }
-
-    fn sub(ev: *Evaluator, args: []const Value) Error!Value {
-        const a = args[0];
-        const b = args[1];
-        switch (a) {
-            .int_t => |x| {
-                if (b != .int_t) return ev.noOverload("_-_", args);
-                const r = @subWithOverflow(x, b.int_t);
-                if (r[1] != 0) return ev.fail("return error for overflow: integer subtraction {d} - {d}", .{ x, b.int_t });
-                return .{ .int_t = r[0] };
-            },
-            .uint_t => |x| {
-                if (b != .uint_t) return ev.noOverload("_-_", args);
-                const r = @subWithOverflow(x, b.uint_t);
-                if (r[1] != 0) return ev.fail("return error for overflow: unsigned subtraction {d} - {d}", .{ x, b.uint_t });
-                return .{ .uint_t = r[0] };
-            },
-            .double_t => |x| {
-                if (b != .double_t) return ev.noOverload("_-_", args);
-                return .{ .double_t = x - b.double_t };
-            },
-            .duration_t => |x| {
-                if (b == .duration_t) return ev.durationSub(x, b.duration_t);
-                return ev.noOverload("_-_", args);
-            },
-            .timestamp_t => |x| {
-                if (b == .timestamp_t) return ev.timestampSub(x, b.timestamp_t);
-                if (b == .duration_t) return ev.timestampSubDuration(x, b.duration_t);
-                return ev.noOverload("_-_", args);
-            },
-            else => return ev.noOverload("_-_", args),
-        }
-    }
-
-    fn mul(ev: *Evaluator, args: []const Value) Error!Value {
-        const a = args[0];
-        const b = args[1];
-        switch (a) {
-            .int_t => |x| {
-                if (b != .int_t) return ev.noOverload("_*_", args);
-                const r = @mulWithOverflow(x, b.int_t);
-                if (r[1] != 0) return ev.fail("return error for overflow: integer multiplication {d} * {d}", .{ x, b.int_t });
-                return .{ .int_t = r[0] };
-            },
-            .uint_t => |x| {
-                if (b != .uint_t) return ev.noOverload("_*_", args);
-                const r = @mulWithOverflow(x, b.uint_t);
-                if (r[1] != 0) return ev.fail("return error for overflow: unsigned multiplication {d} * {d}", .{ x, b.uint_t });
-                return .{ .uint_t = r[0] };
-            },
-            .double_t => |x| {
-                if (b != .double_t) return ev.noOverload("_*_", args);
-                return .{ .double_t = x * b.double_t };
-            },
-            else => return ev.noOverload("_*_", args),
-        }
-    }
-
-    fn div(ev: *Evaluator, args: []const Value) Error!Value {
-        const a = args[0];
-        const b = args[1];
-        switch (a) {
-            .int_t => |x| {
-                if (b != .int_t) return ev.noOverload("_/_", args);
-                const y = b.int_t;
-                if (y == 0) return ev.fail("divide by zero (integer division by zero)", .{});
-                if (x == std.math.minInt(i64) and y == -1) return ev.fail("return error for overflow: integer division overflow", .{});
-                return .{ .int_t = @divTrunc(x, y) };
-            },
-            .uint_t => |x| {
-                if (b != .uint_t) return ev.noOverload("_/_", args);
-                const y = b.uint_t;
-                if (y == 0) return ev.fail("divide by zero (unsigned division by zero)", .{});
-                return .{ .uint_t = x / y };
-            },
-            .double_t => |x| {
-                if (b != .double_t) return ev.noOverload("_/_", args);
-                return .{ .double_t = x / b.double_t };
-            },
-            else => return ev.noOverload("_/_", args),
-        }
-    }
-
-    fn rem(ev: *Evaluator, args: []const Value) Error!Value {
-        const a = args[0];
-        const b = args[1];
-        switch (a) {
-            .int_t => |x| {
-                if (b != .int_t) return ev.noOverload("_%_", args);
-                const y = b.int_t;
-                if (y == 0) return ev.fail("modulus by zero", .{});
-                if (x == std.math.minInt(i64) and y == -1) return ev.fail("return error for overflow: integer modulus overflow", .{});
-                return .{ .int_t = @rem(x, y) };
-            },
-            .uint_t => |x| {
-                if (b != .uint_t) return ev.noOverload("_%_", args);
-                const y = b.uint_t;
-                if (y == 0) return ev.fail("modulus by zero", .{});
-                return .{ .uint_t = x % y };
-            },
-            else => return ev.noOverload("_%_", args),
-        }
-    }
-
-    // ---- comparisons ----
-
-    fn compare(ev: *Evaluator, name: []const u8, args: []const Value) Error!Value {
-        const a = args[0];
-        const b = args[1];
-        // Type agreement (numeric cross-type allowed).
-        const numeric_ok = a.isNumeric() and b.isNumeric();
-        if (!numeric_ok and std.meta.activeTag(a) != std.meta.activeTag(b)) {
-            return ev.noOverload(name, args);
-        }
-        // NaN makes every ordering comparison false.
-        if (a == .double_t and std.math.isNan(a.double_t)) return .{ .bool_t = false };
-        if (b == .double_t and std.math.isNan(b.double_t)) return .{ .bool_t = false };
-        const order = Value.compare(a, b) orelse return ev.noOverload(name, args);
-        const want_lt = std.mem.eql(u8, name, "_<_") or std.mem.eql(u8, name, "_<=_");
-        const want_eq = std.mem.eql(u8, name, "_<=_") or std.mem.eql(u8, name, "_>=_");
-        const result = switch (order) {
-            .lt => want_lt,
-            .gt => !want_lt,
-            .eq => want_eq,
-        };
-        return .{ .bool_t = result };
-    }
-
-    fn inOp(ev: *Evaluator, args: []const Value) Error!Value {
-        const needle = args[0];
-        switch (args[1]) {
-            .list_t => |l| {
-                for (l) |item| {
-                    if (Value.eql(needle, item)) return .{ .bool_t = true };
-                }
-                return .{ .bool_t = false };
-            },
-            .map_t => |m| return .{ .bool_t = m.has(needle) },
-            else => return ev.noOverload("@in", args),
-        }
-    }
-
-    fn index(ev: *Evaluator, args: []const Value) Error!Value {
-        const container = args[0];
-        const key = args[1];
-        switch (container) {
-            .list_t => |l| {
-                // Integral numeric index (int, uint, or integral double).
-                var idx: i64 = undefined;
-                switch (key) {
-                    .int_t => |i| idx = i,
-                    .uint_t => |u| {
-                        if (u > std.math.maxInt(i64)) return ev.fail("invalid_argument: index out of range: {d} (list size {d})", .{ u, l.len });
-                        idx = @intCast(u);
-                    },
-                    .double_t => |d| {
-                        if (std.math.isNan(d) or std.math.isInf(d) or @trunc(d) != d) {
-                            return ev.fail("invalid_argument: list index must be an integer, got {d}", .{d});
-                        }
-                        if (d >= 9223372036854775808.0 or d < -9223372036854775808.0) {
-                            return ev.fail("invalid_argument: index out of range: {d} (list size {d})", .{ d, l.len });
-                        }
-                        idx = @intFromFloat(d);
-                    },
-                    else => return ev.fail("invalid_argument: list index must be an integer, not {s}", .{key.typeOf().name()}),
-                }
-                if (idx < 0 or idx >= l.len) {
-                    return ev.fail("invalid_argument: index out of range: {d} (list size {d})", .{ idx, l.len });
-                }
-                return l[@intCast(idx)];
-            },
-            .map_t => |m| {
-                return m.get(key) orelse {
-                    var aw = std.Io.Writer.Allocating.init(ev.alloc);
-                    key.format(&aw.writer) catch return error.OutOfMemory;
-                    return ev.fail("no such key: {s}", .{aw.written()});
-                };
-            },
-            else => return ev.noOverload("_[_]", args),
-        }
-    }
-
-    // ---- strings ----
-
-    fn size(ev: *Evaluator, args: []const Value) Error!Value {
-        switch (args[0]) {
-            .string_t => |s| {
-                var n: i64 = 0;
-                var i: usize = 0;
-                while (i < s.len) {
-                    const l = std.unicode.utf8ByteSequenceLength(s[i]) catch {
-                        return ev.fail("invalid UTF-8 in string", .{});
-                    };
-                    i += l;
-                    n += 1;
-                }
-                return .{ .int_t = n };
-            },
-            .bytes_t => |s| return .{ .int_t = @intCast(s.len) },
-            .list_t => |l| return .{ .int_t = @intCast(l.len) },
-            .map_t => |m| return .{ .int_t = @intCast(m.size()) },
-            else => return ev.noOverload("size", args),
-        }
-    }
-
-    fn contains(ev: *Evaluator, args: []const Value) Error!Value {
-        if (args[0] != .string_t or args[1] != .string_t) return ev.noOverload("contains", args);
-        const hay = args[0].string_t;
-        const needle = args[1].string_t;
-        if (needle.len == 0) return .{ .bool_t = true };
-        if (needle.len > hay.len) return .{ .bool_t = false };
-        return .{ .bool_t = std.mem.indexOf(u8, hay, needle) != null };
-    }
-
-    fn startsEndsWith(ev: *Evaluator, args: []const Value, starts: bool) Error!Value {
-        const fn_name = if (starts) "startsWith" else "endsWith";
-        if (args[0] != .string_t or args[1] != .string_t) return ev.noOverload(fn_name, args);
-        const s = args[0].string_t;
-        const part = args[1].string_t;
-        if (part.len > s.len) return .{ .bool_t = false };
-        return .{ .bool_t = if (starts) std.mem.startsWith(u8, s, part) else std.mem.endsWith(u8, s, part) };
-    }
-
-    fn matches(ev: *Evaluator, args: []const Value) Error!Value {
-        if (args[0] != .string_t or args[1] != .string_t) return ev.noOverload("matches", args);
-        const input = args[0].string_t;
-        const pattern = args[1].string_t;
-        var re = regex.Regex.compile(ev.alloc, pattern) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return ev.fail("invalid regular expression: {s}", .{pattern}),
-        };
-        return .{ .bool_t = re.matches(input) };
-    }
-
-    // ---- conversions ----
-
-    fn parseIntStr(ev: *Evaluator, s: []const u8, comptime T: type, fn_name: []const u8) Error!Value {
-        if (s.len == 0) return ev.convErr(fn_name, "empty string");
-        var i: usize = 0;
-        var neg = false;
-        if (s[0] == '-') {
-            neg = true;
-            i = 1;
-        } else if (s[0] == '+') {
-            i = 1;
-        }
-        if (i >= s.len) return ev.convErr(fn_name, "no digits");
-        var mag: u64 = 0;
-        while (i < s.len) : (i += 1) {
-            const c = s[i];
-            if (c < '0' or c > '9') return ev.convErr(fn_name, "invalid digit");
-            mag = mag *% 10 +% (c - '0');
-            if (mag > (1 << 63)) return ev.rangeErr(fn_name, "out of range");
-        }
-        if (T == i64) {
-            if (neg) {
-                if (mag > @as(u64, 1) << 63) return ev.rangeErr(fn_name, "out of range");
-                if (mag == @as(u64, 1) << 63) return .{ .int_t = std.math.minInt(i64) };
-                return .{ .int_t = -@as(i64, @intCast(mag)) };
-            }
-            if (mag > std.math.maxInt(i64)) return ev.rangeErr(fn_name, "out of range");
-            return .{ .int_t = @intCast(mag) };
-        } else {
-            if (neg) return ev.rangeErr(fn_name, "negative value");
-            return .{ .uint_t = mag };
-        }
-    }
-
-    fn convErr(ev: *Evaluator, fn_name: []const u8, why: []const u8) Error {
-        return ev.fail("Type conversion error: cannot convert to {s}: {s}", .{ fn_name, why });
-    }
-
-    fn rangeErr(ev: *Evaluator, fn_name: []const u8, why: []const u8) Error {
-        return ev.fail("range error: {s}: {s}", .{ fn_name, why });
-    }
-
-    fn toInt(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .int_t => return v,
-            .uint_t => |u| {
-                if (u > std.math.maxInt(i64)) return ev.rangeErr("int", "uint value out of range");
-                return .{ .int_t = @intCast(u) };
-            },
-            .double_t => |d| {
-                if (std.math.isNan(d)) return ev.rangeErr("int", "NaN");
-                const t = @trunc(d);
-                // The range is (minInt, maxInt) non-inclusive at both ends.
-                if (t >= 9223372036854775808.0 or t <= -9223372036854775808.0) return ev.rangeErr("int", "double value out of range");
-                return .{ .int_t = @intFromFloat(t) };
-            },
-            .string_t => |s| return ev.parseIntStr(s, i64, "int"),
-            .timestamp_t => |ts| return .{ .int_t = ts.seconds },
-            else => return ev.noOverload("int", &.{v}),
-        }
-    }
-
-    fn toUint(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .uint_t => return v,
-            .int_t => |i| {
-                if (i < 0) return ev.rangeErr("uint", "negative value");
-                return .{ .uint_t = @intCast(i) };
-            },
-            .double_t => |d| {
-                if (std.math.isNan(d)) return ev.rangeErr("uint", "NaN");
-                const t = @trunc(d);
-                if (t >= 18446744073709551616.0 or t < 0) return ev.rangeErr("uint", "double value out of range");
-                return .{ .uint_t = @intFromFloat(t) };
-            },
-            .string_t => |s| return ev.parseIntStr(s, u64, "uint"),
-            else => return ev.noOverload("uint", &.{v}),
-        }
-    }
-
-    fn toDouble(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .double_t => return v,
-            .int_t => |i| return .{ .double_t = @floatFromInt(i) },
-            .uint_t => |u| return .{ .double_t = @floatFromInt(u) },
-            .string_t => |s| {
-                if (s.len == 0) return ev.convErr("double", "empty string");
-                // Reject leading/trailing whitespace and hex (Go's
-                // strconv.ParseFloat accepts "0x1p2"; CEL does not).
-                for (s, 0..) |c, i| {
-                    if (c == ' ' or c == '\t' or c == '\n' or c == '\r') return ev.convErr("double", "whitespace");
-                    if ((c == 'x' or c == 'X') and i > 0 and s[0] == '0' and s.len > 1) return ev.convErr("double", "hex float");
-                    if (c == 'p' or c == 'P') return ev.convErr("double", "hex float");
-                }
-                const d = std.fmt.parseFloat(f64, s) catch return ev.convErr("double", "invalid syntax");
-                return .{ .double_t = d };
-            },
-            else => return ev.noOverload("double", &.{v}),
-        }
-    }
-
-    fn toString(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .string_t => return v,
-            .bool_t => |b| return .{ .string_t = if (b) "true" else "false" },
-            .int_t => |i| return .{ .string_t = try std.fmt.allocPrint(ev.alloc, "{d}", .{i}) },
-            .uint_t => |u| return .{ .string_t = try std.fmt.allocPrint(ev.alloc, "{d}", .{u}) },
-            .double_t => |d| {
-                var aw = std.Io.Writer.Allocating.init(ev.alloc);
-                aw.writer.printFloat(d, .{ .mode = .decimal }) catch return error.OutOfMemory;
-                return .{ .string_t = aw.toOwnedSlice() catch return error.OutOfMemory };
-            },
-            .bytes_t => |s| {
-                if (!std.unicode.utf8ValidateSlice(s)) return ev.fail("invalid UTF-8 in bytes: cannot convert to string", .{});
-                return .{ .string_t = s };
-            },
-            .timestamp_t => |ts| {
-                const buf = time.formatTimestamp(ts);
-                return .{ .string_t = try ev.alloc.dupe(u8, std.mem.sliceTo(&buf, 0)) };
-            },
-            .duration_t => |d| {
-                var aw = std.Io.Writer.Allocating.init(ev.alloc);
-                time.formatDuration(d, &aw.writer) catch return error.OutOfMemory;
-                return .{ .string_t = aw.toOwnedSlice() catch return error.OutOfMemory };
-            },
-            else => return ev.noOverload("string", &.{v}),
-        }
-    }
-
-    fn toBool(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .bool_t => return v,
-            .string_t => |s| {
-                const truthy = [_][]const u8{ "1", "t", "T", "true", "TRUE", "True" };
-                const falsy = [_][]const u8{ "0", "f", "F", "false", "FALSE", "False" };
-                for (truthy) |t| {
-                    if (std.mem.eql(u8, s, t)) return .{ .bool_t = true };
-                }
-                for (falsy) |f| {
-                    if (std.mem.eql(u8, s, f)) return .{ .bool_t = false };
-                }
-                return ev.convErr("bool", "invalid boolean literal");
-            },
-            else => return ev.noOverload("bool", &.{v}),
-        }
-    }
-
-    fn toBytes(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .bytes_t => return v,
-            .string_t => |s| return .{ .bytes_t = s },
-            else => return ev.noOverload("bytes", &.{v}),
-        }
-    }
-
-    fn toDuration(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .duration_t => return v,
-            .string_t => |s| {
-                const d = time.parseDuration(s) catch return ev.convErr("duration", "invalid duration string");
-                return .{ .duration_t = d };
-            },
-            else => return ev.noOverload("duration", &.{v}),
-        }
-    }
-
-    fn toTimestamp(ev: *Evaluator, v: Value) Error!Value {
-        switch (v) {
-            .timestamp_t => return v,
-            .int_t => |i| {
-                if (i < time.Timestamp.min_seconds or i > time.Timestamp.max_seconds) {
-                    return ev.rangeErr("timestamp", "seconds out of range");
-                }
-                return .{ .timestamp_t = .{ .seconds = i, .nanos = 0 } };
-            },
-            .string_t => |s| {
-                const t = time.parseTimestamp(s) catch return ev.convErr("timestamp", "invalid timestamp string");
-                return .{ .timestamp_t = t };
-            },
-            else => return ev.noOverload("timestamp", &.{v}),
-        }
-    }
-
-    // ---- duration/timestamp arithmetic ----
-
-    fn durationAdd(ev: *Evaluator, a: value_mod.Duration, b: value_mod.Duration) Error!Value {
-        const nanos = @as(i128, a.seconds) * 1_000_000_000 + a.nanos + @as(i128, b.seconds) * 1_000_000_000 + b.nanos;
-        const d = time.durationFromNanos(nanos) catch return ev.rangeErr("duration addition", "out of range");
-        return .{ .duration_t = d };
-    }
-
-    fn durationSub(ev: *Evaluator, a: value_mod.Duration, b: value_mod.Duration) Error!Value {
-        const nanos = @as(i128, a.seconds) * 1_000_000_000 + a.nanos - (@as(i128, b.seconds) * 1_000_000_000 + b.nanos);
-        const d = time.durationFromNanos(nanos) catch return ev.rangeErr("duration subtraction", "out of range");
-        return .{ .duration_t = d };
-    }
-
-    fn timestampAddDuration(ev: *Evaluator, ts: value_mod.Timestamp, d: value_mod.Duration) Error!Value {
-        const nanos = @as(i128, ts.seconds) * 1_000_000_000 + ts.nanos + @as(i128, d.seconds) * 1_000_000_000 + d.nanos;
-        return ev.timestampFromNanos(nanos);
-    }
-
-    fn timestampSubDuration(ev: *Evaluator, ts: value_mod.Timestamp, d: value_mod.Duration) Error!Value {
-        const nanos = @as(i128, ts.seconds) * 1_000_000_000 + ts.nanos - (@as(i128, d.seconds) * 1_000_000_000 + d.nanos);
-        return ev.timestampFromNanos(nanos);
-    }
-
-    fn timestampFromNanos(ev: *Evaluator, nanos: i128) Error!Value {
-        if (nanos < @as(i128, time.Timestamp.min_seconds) * 1_000_000_000 or
-            nanos > @as(i128, time.Timestamp.max_seconds) * 1_000_000_000 + 999_999_999)
-        {
-            return ev.rangeErr("timestamp", "out of range");
-        }
-        const secs = @divFloor(nanos, 1_000_000_000);
-        const ns = nanos - secs * 1_000_000_000;
-        return .{ .timestamp_t = .{ .seconds = @intCast(secs), .nanos = @intCast(ns) } };
-    }
-
-    fn timestampSub(ev: *Evaluator, a: value_mod.Timestamp, b: value_mod.Timestamp) Error!Value {
-        const nanos = @as(i128, a.seconds) * 1_000_000_000 + a.nanos - (@as(i128, b.seconds) * 1_000_000_000 + b.nanos);
-        const d = time.durationFromNanos(nanos) catch return ev.rangeErr("timestamp subtraction", "out of range");
-        return .{ .duration_t = d };
-    }
-
-    // ---- time field accessors ----
-
-    fn getTimeField(ev: *Evaluator, name: []const u8, args: []const Value) Error!Value {
-        const v = args[0];
-        var tz = time.TimeZone{ .offset_secs = 0 };
-        if (args.len == 2) {
-            if (args[1] != .string_t) return ev.noOverload(name, args);
-            const seconds: i64 = if (v == .timestamp_t) v.timestamp_t.seconds else 0;
-            tz = time.TimeZone.resolve(args[1].string_t, seconds) catch return ev.convErr(name, "unknown timezone");
-        } else if (args.len != 1) {
-            return ev.noOverload(name, args);
-        }
-
-        if (v == .duration_t) {
-            const d = v.duration_t;
-            const total_nanos = time.durationToNanos(d);
-            if (std.mem.eql(u8, name, "getHours")) return .{ .int_t = @intCast(@divTrunc(total_nanos, 3_600_000_000_000)) };
-            if (std.mem.eql(u8, name, "getMinutes")) return .{ .int_t = @intCast(@divTrunc(total_nanos, 60_000_000_000)) };
-            if (std.mem.eql(u8, name, "getSeconds")) return .{ .int_t = @intCast(@divTrunc(total_nanos, 1_000_000_000)) };
-            if (std.mem.eql(u8, name, "getMilliseconds")) return .{ .int_t = @intCast(@divTrunc(@rem(total_nanos, 1_000_000_000), 1_000_000)) };
-            return ev.noOverload(name, args);
-        }
-        if (v == .timestamp_t) {
-            const parts = time.tsParts(v.timestamp_t, tz);
-            if (std.mem.eql(u8, name, "getFullYear")) return .{ .int_t = parts.year };
-            if (std.mem.eql(u8, name, "getMonth")) return .{ .int_t = @as(i64, parts.month) - 1 };
-            if (std.mem.eql(u8, name, "getDate")) return .{ .int_t = @as(i64, parts.day) };
-            if (std.mem.eql(u8, name, "getDayOfMonth")) return .{ .int_t = @as(i64, parts.day) - 1 };
-            if (std.mem.eql(u8, name, "getDayOfWeek")) return .{ .int_t = @as(i64, parts.day_of_week) };
-            if (std.mem.eql(u8, name, "getDayOfYear")) return .{ .int_t = parts.day_of_year };
-            if (std.mem.eql(u8, name, "getHours")) return .{ .int_t = @as(i64, parts.hour) };
-            if (std.mem.eql(u8, name, "getMinutes")) return .{ .int_t = @as(i64, parts.minute) };
-            if (std.mem.eql(u8, name, "getSeconds")) return .{ .int_t = @as(i64, parts.second) };
-            if (std.mem.eql(u8, name, "getMilliseconds")) return .{ .int_t = @as(i64, parts.millis) };
-        }
-        return ev.noOverload(name, args);
+        return stdlib.callByName(&ev.ctx, name, args.items);
     }
 
     // ---- macros (comprehensions) ----
@@ -1045,7 +406,7 @@ pub const Evaluator = struct {
                                 if (b == !is_all) return .{ .bool_t = !is_all };
                             },
                             else => {
-                                return ev.noOverload(if (is_all) "all" else "exists", &.{p});
+                                return ev.ctx.noOverload(if (is_all) .macro_all else .macro_exists, &.{p});
                             },
                         }
                     } else {
@@ -1053,7 +414,7 @@ pub const Evaluator = struct {
                     }
                 }
                 if (saw_error) {
-                    return ev.fail("{s}", .{if (ev.err_msg.len > 0) ev.err_msg else "evaluation error"});
+                    return ev.fail("{s}", .{if (ev.ctx.err_msg.len > 0) ev.ctx.err_msg else "evaluation error"});
                 }
                 return .{ .bool_t = is_all };
             },
@@ -1067,7 +428,7 @@ pub const Evaluator = struct {
                         .bool_t => |b| {
                             if (b) count += 1;
                         },
-                        else => return ev.noOverload("exists_one", &.{p}),
+                        else => return ev.ctx.noOverload(.macro_exists_one, &.{p}),
                     }
                 }
                 return .{ .bool_t = count == 1 };
@@ -1083,7 +444,7 @@ pub const Evaluator = struct {
                         .bool_t => |b| {
                             if (b) try out.append(ev.alloc, item);
                         },
-                        else => return ev.noOverload("filter", &.{p}),
+                        else => return ev.ctx.noOverload(.macro_filter, &.{p}),
                     }
                 }
                 return .{ .list_t = try ev.alloc.dupe(Value, out.items) };
@@ -1102,7 +463,7 @@ pub const Evaluator = struct {
                             .bool_t => |b| {
                                 if (!b) continue;
                             },
-                            else => return ev.noOverload("map", &.{p}),
+                            else => return ev.ctx.noOverload(.macro_map, &.{p}),
                         }
                     }
                     try out.append(ev.alloc, try ev.eval(transform));
@@ -1144,7 +505,7 @@ const tests = struct {
         var ev = Evaluator.init(arena.allocator(), tree);
         const v = ev.run(vars) catch |err| switch (err) {
             error.Eval => {
-                std.debug.print("eval error: {s} (expr: {s})\n", .{ ev.err_msg, src });
+                std.debug.print("eval error: {s} (expr: {s})\n", .{ ev.ctx.err_msg, src });
                 return null;
             },
             else => return error.OutOfMemory,
