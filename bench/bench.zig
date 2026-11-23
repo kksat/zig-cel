@@ -22,6 +22,7 @@ const Case = struct {
     name: []const u8,
     expr: []const u8,
     vars: []const Binding = &.{},
+    ext: cel.ext.Extensions = .{},
 };
 
 fn makeBindings(a: std.mem.Allocator) ![]Binding {
@@ -62,6 +63,13 @@ const cases = [_]Case{
     .{ .name = "in_operator", .expr = "x in [1, 42, 99] && 'user' in payload" },
     .{ .name = "conversions", .expr = "int('123') + 7 == 130 && string(42) == '42'" },
     .{ .name = "size_checks", .expr = "size(items) == 10 && size(name) == 20" },
+    // Extension benchmarks (math + strings enabled).
+    .{ .name = "math_greatest_list", .expr = "math.greatest(items) > 9", .ext = .{ .math = true } },
+    .{ .name = "math_greatest_args", .expr = "math.greatest(x, y, a, b) > 99", .ext = .{ .math = true } },
+    .{ .name = "math_bitops", .expr = "math.bitAnd(x, 1023) + math.bitOr(y, 7) == 49", .ext = .{ .math = true } },
+    .{ .name = "string_charat_indexof", .expr = "name.charAt(0) == 'p' && name.indexOf('middle') > 0", .ext = .{ .strings = true } },
+    .{ .name = "string_format", .expr = "'value: %d %.2f %s'.format([x, 1.5, name]) != ''", .ext = .{ .strings = true } },
+    .{ .name = "string_split_join", .expr = "name.split('-').size() == 3 && ['a', 'b'].join(',') == 'a,b'", .ext = .{ .strings = true } },
 };
 
 /// Counting allocator: tracks allocation count and bytes.
@@ -165,15 +173,15 @@ pub fn main() !void {
         var parse_arena = std.heap.ArenaAllocator.init(alloc);
         defer parse_arena.deinit();
         {
-            const warm = try parser.parseSrc(parse_arena.allocator(), case.expr, .{});
-            _ = try vm.Compiler.compile(parse_arena.allocator(), warm.ok);
+            const warm = try parser.parseSrc(parse_arena.allocator(), case.expr, .{ .ext = case.ext });
+            _ = try vm.Compiler.compile(parse_arena.allocator(), warm.ok, .{ .ext = case.ext });
         }
         _ = parse_arena.reset(.retain_capacity);
         timer.reset();
-        const r = try parser.parseSrc(parse_arena.allocator(), case.expr, .{});
+        const r = try parser.parseSrc(parse_arena.allocator(), case.expr, .{ .ext = case.ext });
         const parse_ns = timer.read();
         timer.reset();
-        _ = try vm.Compiler.compile(parse_arena.allocator(), r.ok);
+        _ = try vm.Compiler.compile(parse_arena.allocator(), r.ok, .{ .ext = case.ext });
         const compile_ns = timer.read();
         parse_total_ns += parse_ns;
         compile_total_ns += compile_ns;
@@ -186,7 +194,7 @@ pub fn main() !void {
         };
 
         // Compile once (bytecode VM).
-        const prog = vm.Compiler.compile(parse_arena.allocator(), tree) catch {
+        const prog = vm.Compiler.compile(parse_arena.allocator(), tree, .{ .ext = case.ext }) catch {
             try w.print("{s:<22} COMPILE ERROR\n", .{case.name});
             continue;
         };

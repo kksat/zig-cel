@@ -398,6 +398,11 @@ pub const Parser = struct {
         return p.lex.next();
     }
 
+    /// Textproto allows optional commas after field values.
+    fn skipCommas(p: *Parser) Error!void {
+        while (try p.lex.peek() == .comma) _ = try p.next();
+    }
+
     /// Read a string value, concatenating adjacent string literals
     /// (textproto implicit concatenation across lines).
     fn readString(p: *Parser) Error![]const u8 {
@@ -423,6 +428,7 @@ pub const Parser = struct {
         var name: []const u8 = "";
         var sections = std.ArrayList(Section){};
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .eof) break;
             if (t != .ident) return error.Parse;
@@ -443,10 +449,12 @@ pub const Parser = struct {
     fn parseSection(p: *Parser) Error!Section {
         var name: []const u8 = "";
         var tests = std.ArrayList(Test){};
-        // '{'
+        const lead = try p.lex.peek();
+        if (lead == .colon) _ = try p.next();
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -466,9 +474,12 @@ pub const Parser = struct {
         var out_test = Test{ .name = "", .expr = "" };
         var bindings = std.ArrayList(Binding){};
         var result: Result = .default_true;
+        const lead = try p.lex.peek();
+        if (lead == .colon) _ = try p.next();
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -527,6 +538,7 @@ pub const Parser = struct {
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -549,6 +561,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var out: ExprValue = .{ .val = .unset };
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -577,6 +590,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var out: TValue = .unset;
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -594,6 +608,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var out: TValue = .unset;
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -658,6 +673,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var items = std.ArrayList(TValue){};
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -677,6 +693,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var entries = std.ArrayList(TEntry){};
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -722,6 +739,7 @@ pub const Parser = struct {
         var nanos: i64 = 0;
         var saw_field = false;
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -760,6 +778,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var msgs = std.ArrayList([]const u8){};
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;
@@ -793,6 +812,7 @@ pub const Parser = struct {
         if (open != .lbrace) return error.Parse;
         var msgs = std.ArrayList([]const u8){};
         while (true) {
+            try p.skipCommas();
             const t = try p.next();
             if (t == .rbrace) break;
             if (t != .ident) return error.Parse;

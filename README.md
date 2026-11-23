@@ -48,6 +48,12 @@ environment, `Program.Eval`) on the same corpus and machine:
 | nested macros (10x10)   |  9,487 ns    |  2,300 ns     |  4.1x   |      11          |        0          |
 | conversions             |    287 ns    |     44 ns     |  6.5x   |       2          |        0          |
 | size checks             |    210 ns    |    130 ns     |  1.6x   |       2          |        0          |
+| math.greatest (list)    |    461 ns    |    232 ns     |  2.0x   |       2          |        0          |
+| math.greatest (4 args)  |    360 ns    |    178 ns     |  2.0x   |       3          |        0          |
+| math bitwise ops        |    203 ns    |    123 ns     |  1.7x   |       0          |        0          |
+| charAt + indexOf        |    370 ns    |    159 ns     |  2.3x   |       4          |        0          |
+| string.format           |  1,225 ns    |    431 ns     |  2.8x   |      21          |        0*         |
+| split + join            |    585 ns    |    231 ns     |  2.5x   |       9          |        0*         |
 
 \* aggregate outputs are allocated in the caller's per-run arena (bump
 allocation); no allocator round-trips in steady state.
@@ -64,7 +70,7 @@ unboxed value representations with ~20-30% upside).
 `zig build conformance` runs the vendored cel-spec simple suites:
 
 ```
-TOTAL: 1162 passed, 0 failed, 324 skipped (33 message mismatches, non-fatal)
+TOTAL: 1574 passed, 0 failed, 327 skipped (74 message mismatches, non-fatal)
 ```
 
 Skipped tests require unimplemented features: protocol buffer messages
@@ -120,6 +126,19 @@ by a run reference the arena passed to it.
 - Standard functions: arithmetic, comparisons, equality, `in`, indexing,
   `size`, `contains`/`startsWith`/`endsWith`/`matches`, conversions,
   timestamp/duration accessors with timezones.
+- Extensions (opt-in at parse and evaluation time, like cel-go):
+  - **math**: `math.greatest`/`math.least` var-arg macros (expanding to
+    `math.@min`/`math.@max` with heterogeneous numeric comparison),
+    `ceil`, `floor`, `round`, `trunc`, `abs`, `sign`, `isInf`, `isNaN`,
+    `isFinite`, `sqrt`, and the bitwise functions (`bitAnd`, `bitOr`,
+    `bitXor`, `bitNot`, `bitShiftLeft`, `bitShiftRight`) with cel-go/Go
+    shift semantics.
+  - **strings**: `charAt`, `indexOf`, `lastIndexOf`, `lowerAscii`,
+    `upperAscii`, `replace`, `split`, `substring`, `trim`, `join`,
+    `strings.quote`, `reverse`, and `format` (v2 semantics: unquoted
+    strings inside lists/maps, maps sorted by formatted key, and
+    Go-`strconv`-compatible `%.Nf`/`%.Ne` rounding via exact decimal
+    expansion of the double).
 - Not implemented: protocol buffer messages (no protobuf dependency),
   protobuf wrappers, `google.protobuf.Any` unwrapping, extension
   libraries (`cel.bind`, optional types, math/string extensions), the

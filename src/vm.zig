@@ -24,6 +24,7 @@ const ast = @import("ast.zig");
 const value_mod = @import("value.zig");
 const stdlib = @import("stdlib.zig");
 const regex = @import("regex.zig");
+const ext = @import("ext.zig");
 
 pub const Value = value_mod.Value;
 pub const Map = value_mod.Map;
@@ -117,6 +118,8 @@ pub const Program = struct {
     /// Allocator that owns the program (and run-state that persists across
     /// runs, e.g. expanded name candidates).
     backing: std.mem.Allocator,
+    /// Enabled extensions for dispatch.
+    ext: ext.Extensions = .{},
     insts: []Inst,
     consts: []Value,
     names: [][]const u8,
@@ -152,6 +155,7 @@ pub const Program = struct {
             .sp = 0,
         };
         vm.ctx.regexes = prog.regexes;
+        vm.ctx.ext = prog.ext;
         prog.run_vars = vars;
         vm.prepareChains(container) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -899,9 +903,15 @@ const ScopeEntry = struct {
     slot: u32,
 };
 
+pub const CompileOptions = struct {
+    /// Enabled extensions; dispatched functions are gated on this set.
+    ext: ext.Extensions = .{},
+};
+
 pub const Compiler = struct {
     alloc: std.mem.Allocator,
     tree: ast.Ast,
+    options: CompileOptions = .{},
     insts: std.ArrayList(Inst),
     consts: std.ArrayList(Value),
     names: std.ArrayList([]const u8),
@@ -919,10 +929,11 @@ pub const Compiler = struct {
 
     /// Compile an AST into a heap-allocated Program (call `deinit` on the
     /// program when done). `alloc` must outlive the program.
-    pub fn compile(alloc: std.mem.Allocator, tree: ast.Ast) Error!*Program {
+    pub fn compile(alloc: std.mem.Allocator, tree: ast.Ast, options: CompileOptions) Error!*Program {
         var comp = Compiler{
             .alloc = alloc,
             .tree = tree,
+            .options = options,
             .insts = .empty,
             .consts = .empty,
             .names = .empty,
@@ -1321,6 +1332,7 @@ pub const Compiler = struct {
         const n_chains = c.chains.items.len;
 
         prog.backing = alloc;
+        prog.ext = c.options.ext;
         prog.insts = c.insts.toOwnedSlice(alloc) catch return error.OutOfMemory;
         prog.consts = c.consts.toOwnedSlice(alloc) catch return error.OutOfMemory;
         prog.names = c.names.toOwnedSlice(alloc) catch return error.OutOfMemory;
@@ -1366,7 +1378,7 @@ const tests = struct {
                 return null;
             },
         };
-        const prog = try Compiler.compile(arena.allocator(), tree);
+        const prog = try Compiler.compile(arena.allocator(), tree, .{});
         const result = try prog.run(arena.allocator(), vars, "");
         const v = switch (result) {
             .value => |v| v,

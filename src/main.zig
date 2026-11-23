@@ -38,6 +38,7 @@ pub fn main() !void {
     var expr: ?[]const u8 = null;
     var bindings = std.ArrayList(eval.Binding){};
     defer bindings.deinit(alloc);
+    var extensions: cel.ext.Extensions = .{};
     // Arena that keeps binding values alive for the whole run.
     var bind_arena = std.heap.ArenaAllocator.init(alloc);
     defer bind_arena.deinit();
@@ -45,6 +46,14 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "eval") or std.mem.eql(u8, arg, "run")) {
             continue; // subcommand
+        }
+        if (std.mem.eql(u8, arg, "--math")) {
+            extensions.math = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--strings")) {
+            extensions.strings = true;
+            continue;
         }
         if (std.mem.eql(u8, arg, "--bind")) {
             const kv = args.next() orelse {
@@ -81,7 +90,7 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     const a = arena.allocator();
 
-    const r = try parser.parseSrc(a, src, .{});
+    const r = try parser.parseSrc(a, src, .{ .ext = extensions });
     const tree = switch (r) {
         .ok => |t| t,
         .err => |e| {
@@ -89,7 +98,7 @@ pub fn main() !void {
             std.process.exit(1);
         },
     };
-    const prog = cel.vm.Compiler.compile(a, tree) catch {
+    const prog = cel.vm.Compiler.compile(a, tree, .{ .ext = extensions }) catch {
         std.debug.print("compile error\n", .{});
         std.process.exit(1);
     };

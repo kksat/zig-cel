@@ -7,6 +7,7 @@ const std = @import("std");
 const value_mod = @import("value.zig");
 const time = @import("time.zig");
 const regex = @import("regex.zig");
+const ext = @import("ext.zig");
 
 pub const Value = value_mod.Value;
 pub const Map = value_mod.Map;
@@ -71,6 +72,39 @@ pub const FnId = enum(u8) {
     get_minutes,
     get_seconds,
     get_milliseconds,
+    // math extension (math.*)
+    math_min,
+    math_max,
+    math_ceil,
+    math_floor,
+    math_round,
+    math_trunc,
+    math_abs,
+    math_sign,
+    math_is_inf,
+    math_is_nan,
+    math_is_finite,
+    math_sqrt,
+    math_bit_and,
+    math_bit_or,
+    math_bit_xor,
+    math_bit_not,
+    math_bit_shift_left,
+    math_bit_shift_right,
+    // strings extension
+    ext_char_at,
+    ext_index_of,
+    ext_last_index_of,
+    ext_lower_ascii,
+    ext_upper_ascii,
+    ext_replace,
+    ext_split,
+    ext_substring,
+    ext_trim,
+    ext_join,
+    ext_strings_quote,
+    ext_reverse,
+    ext_format,
     unknown,
 };
 
@@ -95,6 +129,25 @@ pub fn fnIdFromName(name: []const u8) FnId {
         .{ "getDayOfWeek", FnId.get_day_of_week }, .{ "getDayOfYear", FnId.get_day_of_year },
         .{ "getHours", FnId.get_hours }, .{ "getMinutes", FnId.get_minutes },
         .{ "getSeconds", FnId.get_seconds }, .{ "getMilliseconds", FnId.get_milliseconds },
+        // math extension
+        .{ "math.@min", FnId.math_min },   .{ "math.@max", FnId.math_max },
+        .{ "math.ceil", FnId.math_ceil },  .{ "math.floor", FnId.math_floor },
+        .{ "math.round", FnId.math_round }, .{ "math.trunc", FnId.math_trunc },
+        .{ "math.abs", FnId.math_abs },    .{ "math.sign", FnId.math_sign },
+        .{ "math.isInf", FnId.math_is_inf }, .{ "math.isNaN", FnId.math_is_nan },
+        .{ "math.isFinite", FnId.math_is_finite }, .{ "math.sqrt", FnId.math_sqrt },
+        .{ "math.bitAnd", FnId.math_bit_and }, .{ "math.bitOr", FnId.math_bit_or },
+        .{ "math.bitXor", FnId.math_bit_xor }, .{ "math.bitNot", FnId.math_bit_not },
+        .{ "math.bitShiftLeft", FnId.math_bit_shift_left },
+        .{ "math.bitShiftRight", FnId.math_bit_shift_right },
+        // strings extension
+        .{ "charAt", FnId.ext_char_at },  .{ "indexOf", FnId.ext_index_of },
+        .{ "lastIndexOf", FnId.ext_last_index_of },
+        .{ "lowerAscii", FnId.ext_lower_ascii }, .{ "upperAscii", FnId.ext_upper_ascii },
+        .{ "replace", FnId.ext_replace }, .{ "split", FnId.ext_split },
+        .{ "substring", FnId.ext_substring }, .{ "trim", FnId.ext_trim },
+        .{ "join", FnId.ext_join }, .{ "strings.quote", FnId.ext_strings_quote },
+        .{ "reverse", FnId.ext_reverse }, .{ "format", FnId.ext_format },
     });
     return map.get(name) orelse FnId.unknown;
 }
@@ -140,6 +193,37 @@ pub fn fnName(id: FnId) []const u8 {
         .get_minutes => "getMinutes",
         .get_seconds => "getSeconds",
         .get_milliseconds => "getMilliseconds",
+        .math_min => "math.@min",
+        .math_max => "math.@max",
+        .math_ceil => "math.ceil",
+        .math_floor => "math.floor",
+        .math_round => "math.round",
+        .math_trunc => "math.trunc",
+        .math_abs => "math.abs",
+        .math_sign => "math.sign",
+        .math_is_inf => "math.isInf",
+        .math_is_nan => "math.isNaN",
+        .math_is_finite => "math.isFinite",
+        .math_sqrt => "math.sqrt",
+        .math_bit_and => "math.bitAnd",
+        .math_bit_or => "math.bitOr",
+        .math_bit_xor => "math.bitXor",
+        .math_bit_not => "math.bitNot",
+        .math_bit_shift_left => "math.bitShiftLeft",
+        .math_bit_shift_right => "math.bitShiftRight",
+        .ext_char_at => "charAt",
+        .ext_index_of => "indexOf",
+        .ext_last_index_of => "lastIndexOf",
+        .ext_lower_ascii => "lowerAscii",
+        .ext_upper_ascii => "upperAscii",
+        .ext_replace => "replace",
+        .ext_split => "split",
+        .ext_substring => "substring",
+        .ext_trim => "trim",
+        .ext_join => "join",
+        .ext_strings_quote => "strings.quote",
+        .ext_reverse => "reverse",
+        .ext_format => "format",
         .not => "!_",
         .neg => "-_",
         .and_msg => "_&&_",
@@ -161,6 +245,8 @@ pub const Ctx = struct {
     err_msg: []const u8 = "",
     unbound: bool = false,
     regexes: []*regex.Regex = &.{},
+    /// Enabled extensions (opt-in, like cel-go).
+    ext: ext.Extensions = .{},
 
     pub fn init(alloc: std.mem.Allocator) Ctx {
         return .{ .alloc = alloc };
@@ -227,7 +313,13 @@ fn cachedRegex(c: *Ctx, pattern: []const u8) Error!*regex.Regex {
 }
 
 pub fn call(c: *Ctx, id: FnId, args: []const Value) Error!Value {
+    if (id != .unknown and !ext.available(c.ext, id)) {
+        return c.fail("unbound function: '{s}' is not defined", .{fnName(id)});
+    }
     switch (id) {
+        .math_min, .math_max, .math_ceil, .math_floor, .math_round, .math_trunc, .math_abs, .math_sign, .math_is_inf, .math_is_nan, .math_is_finite, .math_sqrt, .math_bit_and, .math_bit_or, .math_bit_xor, .math_bit_not, .math_bit_shift_left, .math_bit_shift_right, .ext_char_at, .ext_index_of, .ext_last_index_of, .ext_lower_ascii, .ext_upper_ascii, .ext_replace, .ext_split, .ext_substring, .ext_trim, .ext_join, .ext_strings_quote, .ext_reverse, .ext_format => {
+            return ext.call(c, id, args);
+        },
         .not, .neg => {
             // Unary operators (also used by compile-time constant folding).
             const v = args[0];

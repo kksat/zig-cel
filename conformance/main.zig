@@ -24,20 +24,27 @@ const eval = cel.eval;
 const value_mod = cel.value;
 const Value = value_mod.Value;
 
-const test_files = [_][]const u8{
-    "basic.textproto",
-    "comparisons.textproto",
-    "conversions.textproto",
-    "dynamic.textproto",
-    "fp_math.textproto",
-    "integer_math.textproto",
-    "lists.textproto",
-    "logic.textproto",
-    "macros.textproto",
-    "namespace.textproto",
-    "parse.textproto",
-    "string.textproto",
-    "timestamps.textproto",
+const TestFile = struct {
+    name: []const u8,
+    ext: cel.ext.Extensions = .{},
+};
+
+const test_files = [_]TestFile{
+    .{ .name = "basic.textproto" },
+    .{ .name = "comparisons.textproto" },
+    .{ .name = "conversions.textproto" },
+    .{ .name = "dynamic.textproto" },
+    .{ .name = "fp_math.textproto" },
+    .{ .name = "integer_math.textproto" },
+    .{ .name = "lists.textproto" },
+    .{ .name = "logic.textproto" },
+    .{ .name = "macros.textproto" },
+    .{ .name = "math_ext.textproto", .ext = .{ .math = true } },
+    .{ .name = "namespace.textproto" },
+    .{ .name = "parse.textproto" },
+    .{ .name = "string.textproto" },
+    .{ .name = "string_ext.textproto", .ext = .{ .strings = true } },
+    .{ .name = "timestamps.textproto" },
 };
 
 const Stats = struct {
@@ -71,7 +78,9 @@ pub fn main() !void {
 pub fn run(alloc: std.mem.Allocator, w: ?*std.Io.Writer) !Stats {
     var total = Stats{};
 
-    for (test_files) |file_name| {
+    for (test_files) |test_file| {
+        const file_name = test_file.name;
+        const file_ext = test_file.ext;
         const path = try std.fmt.allocPrint(alloc, "conformance/testdata/{s}", .{file_name});
         defer alloc.free(path);
         const src = std.fs.cwd().readFileAlloc(alloc, path, 16 * 1024 * 1024) catch |e| {
@@ -92,7 +101,7 @@ pub fn run(alloc: std.mem.Allocator, w: ?*std.Io.Writer) !Stats {
         var stats = Stats{};
         for (file.sections) |section| {
             for (section.tests) |t| {
-                runTest(a, file.name, section.name, t, &stats);
+                runTest(a, file.name, section.name, t, file_ext, &stats);
             }
         }
         if (w) |out| {
@@ -127,7 +136,7 @@ test "conformance suite" {
     }
 }
 
-fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: textproto.Test, stats: *Stats) void {
+fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: textproto.Test, file_ext: cel.ext.Extensions, stats: *Stats) void {
     const label = std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ file_name, section, t.name }) catch return;
 
     // Skip tests needing unimplemented features.
@@ -143,7 +152,7 @@ fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: 
     }
 
     // Parse.
-    const parsed = parser.parseSrc(a, t.expr, .{ .disable_macros = t.disable_macros }) catch {
+    const parsed = parser.parseSrc(a, t.expr, .{ .disable_macros = t.disable_macros, .ext = file_ext }) catch {
         stats.failed += 1;
         std.debug.print("FAIL {s}: parse error (out of memory)\n  expr: {s}\n", .{ label, t.expr });
         return;
@@ -180,7 +189,7 @@ fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: 
     }
 
     // Compile and evaluate.
-    const prog = cel.vm.Compiler.compile(a, tree) catch {
+    const prog = cel.vm.Compiler.compile(a, tree, .{ .ext = file_ext }) catch {
         stats.failed += 1;
         std.debug.print("FAIL {s}: compile error\n  expr: {s}\n", .{ label, t.expr });
         return;

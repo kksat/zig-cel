@@ -23,6 +23,7 @@ const std = @import("std");
 const token = @import("token.zig");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
+const ext = @import("ext.zig");
 
 pub const Ast = ast.Ast;
 pub const Node = ast.Node;
@@ -35,6 +36,11 @@ pub const Options = struct {
     /// Parse calls that syntactically match macros as ordinary function
     /// calls (conformance: `disable_macros`).
     disable_macros: bool = false,
+    /// Enabled CEL extensions (opt-in, like cel-go's ext.Math()/ext.Strings()):
+    /// `math` enables the math.greatest/math.least macros and the
+    /// math.<fn>(...) qualified function calls; `strings` enables
+    /// strings.quote(...).
+    ext: ext.Extensions = .{},
 };
 
 /// Max expression nesting depth (defensive bound; cel-go uses 250).
@@ -96,6 +102,7 @@ pub const Parser = struct {
     err_pos: usize = 0,
     depth: usize = 0,
     disable_macros: bool = false,
+    options: Options = .{},
 
     const P = Parser;
 
@@ -106,6 +113,7 @@ pub const Parser = struct {
             .nodes = .empty,
             .child_table = .empty,
             .disable_macros = options.disable_macros,
+            .options = options,
         };
     }
 
@@ -123,6 +131,12 @@ pub const Parser = struct {
 
     fn fail(p: *P, pos: usize, msg: []const u8) Error {
         p.err_msg = msg;
+        p.err_pos = pos;
+        return error.Parse;
+    }
+
+    fn failFmt(p: *P, pos: usize, comptime fmt: []const u8, args: anytype) Error {
+        p.err_msg = std.fmt.allocPrint(p.alloc, fmt, args) catch "out of memory";
         p.err_pos = pos;
         return error.Parse;
     }
@@ -343,6 +357,11 @@ pub const Parser = struct {
                         const args = try p.parseArgList();
                         if (try p.maybeMacro(e, ft, args, t.start)) |m| {
                             e = m;
+                        } else if (p.qualifiedFunctionName(e, ft.text)) |dotted| {
+                            // Namespaced extension function (math.ceil,
+                            // strings.quote): a global call with the dotted
+                            // name, mirroring cel-go's checker resolution.
+                            e = try p.call(dotted, args, t.start, false);
                         } else {
                             // The receiver becomes the first argument.
                             const kids = try p.alloc.alloc(NodeIndex, args.len + 1);
@@ -388,12 +407,50 @@ pub const Parser = struct {
         return args.toOwnedSlice(p.alloc);
     }
 
+    /// The math extension function names callable as `math.<name>(...)`.
+    const math_fns = [_][]const u8{
+        "@min", "@max", "ceil",   "floor", "round", "trunc", "abs",
+        "sign", "isInf", "isNaN", "isFinite", "sqrt", "bitAnd", "bitOr",
+        "bitXor", "bitNot", "bitShiftLeft", "bitShiftRight",
+    };
+
+    /// Whether a receiver call `target.name(args)` should be rewritten as a
+    /// global call to the dotted function name (e.g. `math.ceil(x)` ->
+    /// `math.ceil(x)` as a global function, mirroring cel-go's checker
+    /// resolution of namespaced functions). Returns the dotted name.
+    fn qualifiedFunctionName(p: *P, target: NodeIndex, name: []const u8) ?[]const u8 {
+        const t = p.nodes.items[target];
+        if (t.kind != .ident or t.flags.abs) return null;
+        if (std.mem.eql(u8, t.payload.str, "math") and p.options.ext.math) {
+            for (math_fns) |fn_name| {
+                if (std.mem.eql(u8, fn_name, name)) {
+                    return std.fmt.allocPrint(p.alloc, "math.{s}", .{name}) catch null;
+                }
+            }
+        }
+        if (std.mem.eql(u8, t.payload.str, "strings") and p.options.ext.strings) {
+            if (std.mem.eql(u8, name, "quote")) {
+                return "strings.quote";
+            }
+        }
+        return null;
+    }
+
     /// If `target.name(args)` matches a comprehension macro shape, expand it.
     /// Returns null when the call is not macro-shaped (it remains a call and
     /// fails at evaluation as an unknown function).
     fn maybeMacro(p: *P, target: NodeIndex, name_tok: token.Token, args: []const NodeIndex, start: u32) Error!?NodeIndex {
         if (p.disable_macros) return null;
         const name = name_tok.text;
+        // Math extension macros: math.greatest(...) / math.least(...).
+        if (p.options.ext.math) {
+            const t = p.nodes.items[target];
+            if (t.kind == .ident and !t.flags.abs and std.mem.eql(u8, t.payload.str, "math") and
+                (std.mem.eql(u8, name, "greatest") or std.mem.eql(u8, name, "least")))
+            {
+                return try p.expandMathMacro(target, name, args, start);
+            }
+        }
         var mkind: ?MacroKind = null;
         if (std.mem.eql(u8, name, "all")) {
             mkind = .all;
@@ -426,6 +483,70 @@ pub const Parser = struct {
         try kids.appendSlice(p.alloc, args[1..]); // predicate [+ transform]
         try p.setChildren(n, kids.items);
         return n;
+    }
+
+    /// Expand `math.greatest(args...)` / `math.least(args...)` into a
+    /// `math.@max` / `math.@min` call (cel-go ext/math.go):
+    ///   1 numeric-or-dynamic arg  -> math.@min(arg)
+    ///   2 args                    -> math.@min(a, b)
+    ///   3+ args                   -> math.@min([a, b, c])
+    fn expandMathMacro(p: *P, target: NodeIndex, name: []const u8, args: []const NodeIndex, start: u32) Error!NodeIndex {
+        _ = target;
+        const min_form = std.mem.eql(u8, name, "least");
+        const fn_name: []const u8 = if (min_form) "math.@min" else "math.@max";
+        const macro_name: []const u8 = if (min_form) "math.least()" else "math.greatest()";
+        switch (args.len) {
+            0 => return p.failFmt(start, "{s} requires at least one argument", .{macro_name}),
+            1 => {
+                if (isNumericArg(p, args[0]) or isNumericListLiteral(p, args[0])) {
+                    return p.call(fn_name, args, start, false);
+                }
+                return p.failFmt(start, "{s} invalid single argument value", .{macro_name});
+            },
+            2 => {
+                try p.checkNumericArgs(macro_name, args);
+                return p.call(fn_name, args, start, false);
+            },
+            else => {
+                try p.checkNumericArgs(macro_name, args);
+                const list = try p.addNode(.{ .kind = .list, .start = start });
+                try p.setChildren(list, args);
+                return p.call(fn_name, &.{list}, start, false);
+            },
+        }
+    }
+
+    /// cel-go's isNumericArgType: literals must be numeric; list/map/struct
+    /// and other literals are not; non-literals (idents, calls) are
+    /// acceptable.
+    fn isNumericArg(p: *P, node: NodeIndex) bool {
+        const n = p.nodes.items[node];
+        return switch (n.kind) {
+            .int, .uint, .double => true,
+            .string, .bytes, .bool_, .null_, .list, .map, .struct_ => false,
+            else => true,
+        };
+    }
+
+    /// cel-go's isListLiteralWithNumericArgs: a non-empty list literal whose
+    /// elements are all numeric args.
+    fn isNumericListLiteral(p: *P, node: NodeIndex) bool {
+        const n = p.nodes.items[node];
+        if (n.kind != .list) return false;
+        const kids = n.children(p.child_table.items);
+        if (kids.len == 0) return false;
+        for (kids) |k| {
+            if (!p.isNumericArg(k)) return false;
+        }
+        return true;
+    }
+
+    fn checkNumericArgs(p: *P, macro_name: []const u8, args: []const NodeIndex) Error!void {
+        for (args) |arg| {
+            if (!p.isNumericArg(arg)) {
+                return p.failFmt(p.nodes.items[arg].start, "{s} simple literal arguments must be numeric", .{macro_name});
+            }
+        }
     }
 
     fn parsePrimary(p: *P) Error!NodeIndex {

@@ -7,6 +7,7 @@ pub const ast = @import("ast.zig");
 pub const value = @import("value.zig");
 pub const stdlib = @import("stdlib.zig");
 pub const vm = @import("vm.zig");
+pub const ext = @import("ext.zig");
 pub const eval = @import("eval.zig");
 pub const regex = @import("regex.zig");
 pub const time = @import("time.zig");
@@ -20,4 +21,5 @@ test {
     _ = @import("time.zig");
     _ = @import("stdlib.zig");
     _ = @import("vm.zig");
+    _ = @import("ext.zig");
 }

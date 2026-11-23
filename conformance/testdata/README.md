@@ -8,3 +8,6 @@ Suites requiring protocol buffer message support (`proto2`, `proto3`,
 `enums`, `wrappers`), extension libraries (`*_ext`, `macros2`), unknown-set
 semantics (`unknowns`), or check-phase type deduction (`type_deduction`)
 are not vendored.
+
+`math_ext` runs with the math extension enabled; `string_ext` runs with the
+strings extension enabled.
