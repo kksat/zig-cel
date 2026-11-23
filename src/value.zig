@@ -442,8 +442,19 @@ pub const Map = struct {
         return m.entries.len;
     }
 
+    /// Below this size a linear scan beats hashing (typical object-shaped
+    /// maps are tiny).
+    pub const linear_scan_max = 8;
+
     pub fn get(m: *const Map, key: Value) ?Value {
-        if (m.entries.len == 0) return null;
+        const n = m.entries.len;
+        if (n == 0) return null;
+        if (n <= linear_scan_max) {
+            for (m.entries) |*e| {
+                if (Value.eql(e.key, key)) return e.value;
+            }
+            return null;
+        }
         var slot: usize = Value.hash(key) & m.mask;
         while (true) {
             const v = m.index[slot];

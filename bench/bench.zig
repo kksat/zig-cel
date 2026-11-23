@@ -151,19 +151,32 @@ pub fn main() !void {
     try w.print("{s:<22} {s:>10} {s:>10} {s:>10} {s:>9} {s:>10}\n", .{ "----", "---", "------", "----", "-------", "-----" });
 
     var parse_total_ns: u64 = 0;
+    var compile_total_ns: u64 = 0;
     var timer = try std.time.Timer.start();
 
     for (cases) |case| {
         var vars = case.vars;
         if (vars.len == 0) vars = bindings;
 
-        // Parse once (outside the timed loop).
+        // Parse and compile once (outside the timed loop). The arena is
+        // warmed with a first parse so the measurement excludes first-chunk
+        // allocator growth; the timed parse runs on a second program kept
+        // alive separately.
         var parse_arena = std.heap.ArenaAllocator.init(alloc);
         defer parse_arena.deinit();
+        {
+            const warm = try parser.parseSrc(parse_arena.allocator(), case.expr, .{});
+            _ = try vm.Compiler.compile(parse_arena.allocator(), warm.ok);
+        }
+        _ = parse_arena.reset(.retain_capacity);
         timer.reset();
         const r = try parser.parseSrc(parse_arena.allocator(), case.expr, .{});
         const parse_ns = timer.read();
+        timer.reset();
+        _ = try vm.Compiler.compile(parse_arena.allocator(), r.ok);
+        const compile_ns = timer.read();
         parse_total_ns += parse_ns;
+        compile_total_ns += compile_ns;
         const tree = switch (r) {
             .ok => |t| t,
             .err => {
@@ -193,34 +206,38 @@ pub fn main() !void {
         var run_arena = std.heap.ArenaAllocator.init(calloc);
         _ = run_arena.reset(.retain_capacity);
 
-        const iters: usize = 20_000;
-        var times = try alloc.alloc(u64, iters);
+        // Batched timing: each sample times a batch of evaluations and
+        // divides, amortizing the rdtsc overhead (~15ns) that would
+        // otherwise dominate single-op measurements.
+        const batches: usize = 200;
+        const batch: usize = 100;
+        const iters = batches * batch;
+        var times = try alloc.alloc(u64, batches);
         defer alloc.free(times);
         var total_allocs: usize = 0;
         var total_bytes: usize = 0;
 
-        var i: usize = 0;
-        while (i < iters) : (i += 1) {
-            _ = run_arena.reset(.retain_capacity);
+        var b: usize = 0;
+        while (b < batches) : (b += 1) {
             timer.reset();
-            _ = prog.run(run_arena.allocator(), vars, "") catch {};
-            times[i] = timer.read();
-            // Retain capacity keeps the arena chunks; allocations counted
-            // since the reset are what the eval itself needed.
+            var j: usize = 0;
+            while (j < batch) : (j += 1) {
+                _ = run_arena.reset(.retain_capacity);
+                _ = prog.run(run_arena.allocator(), vars, "") catch {};
+            }
+            times[b] = timer.read() / batch;
             total_allocs += counting.allocs;
             total_bytes += counting.bytes;
         }
         run_arena.deinit();
 
         std.mem.sort(u64, times, {}, std.sort.asc(u64));
-        // Subtract the arena's initial-chunk allocations made before the
-        // loop (retained capacity means only the first iterations grow).
         var sum: u128 = 0;
         for (times) |t| sum += t;
         const tr = TimingResult{
             .min_ns = times[0],
-            .median_ns = times[iters / 2],
-            .mean_ns = @intCast(sum / iters),
+            .median_ns = times[batches / 2],
+            .mean_ns = @intCast(sum / batches),
             .allocs_per_op = @as(f64, @floatFromInt(total_allocs)) / @as(f64, @floatFromInt(iters)),
             .bytes_per_op = @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(iters)),
         };
@@ -233,5 +250,6 @@ pub fn main() !void {
             tr.bytes_per_op,
         });
     }
-    try w.print("\nparse total: {d} cases, {d}us\n", .{ cases.len, parse_total_ns / 1000 });
+    try w.print("\nparse:  {d} cases, {d}ns/case (median of 1)\n", .{ cases.len, parse_total_ns / cases.len });
+    try w.print("compile: {d} cases, {d}ns/case\n", .{ cases.len, compile_total_ns / cases.len });
 }

@@ -549,6 +549,10 @@ const CodeGen = struct {
 pub const Regex = struct {
     pattern: []const u8 = "",
     prog: []Inst,
+    /// Simulation entry point: 0 for the search prefix loop, or past it
+    /// when the pattern is anchored (`^...`), skipping useless thread
+    /// spawns at every input position.
+    entry: u32 = 0,
     /// Allocator that owns this regex (for the lazy Pike-VM scratch).
     owner: ?std.mem.Allocator = null,
     /// Lazily allocated simulation scratch, reused across matches. Makes
@@ -568,17 +572,27 @@ pub const Regex = struct {
 
         var g = CodeGen{ .prog = try alloc.alloc(Inst, max_program) };
         errdefer alloc.free(g.prog);
-        // Search prefix: loop over any byte so one pass covers all starts.
-        //   s: split(s+1, pat); ANYBYTE; jmp s; pat: ...; match
+        // Reserve the search-prefix slots (split / any-byte / jmp); they
+        // are filled below unless the pattern is anchored.
         const s = try g.emit(.{ .split = .{ .a = 0, .b = 0 } });
-        g.prog[s].split.a = g.here();
         _ = try g.emit(.{ .char = .{ .set = .{ ~@as(u64, 0), ~@as(u64, 0) }, .any_high = true } });
         _ = try g.emit(.{ .jmp = s });
         g.prog[s].split.b = g.here();
+        const pat_start = g.here();
         try g.gen(root);
         _ = try g.emit(.{ .match = {} });
+        var entry: u32 = 0;
+        if (pat_start < g.len and g.prog[pat_start] == .bol) {
+            // Anchored pattern: start directly at the pattern, skipping the
+            // search loop (threads from other positions would die at `^`).
+            entry = pat_start;
+        } else {
+            // Search prefix: loop over any byte so one pass covers all
+            // start positions.
+            g.prog[s].split.a = s + 1;
+        }
         const prog = try alloc.realloc(g.prog, g.len);
-        return .{ .pattern = pattern, .prog = prog, .owner = alloc };
+        return .{ .pattern = pattern, .prog = prog, .entry = entry, .owner = alloc };
     }
 
     pub fn deinit(r: *Regex, alloc: std.mem.Allocator) void {
@@ -631,7 +645,7 @@ pub const Regex = struct {
         var a = s.cur;
         s.gen[a] +%= 1;
         s.count[a] = 0;
-        addThread(r, s, a, 0, input, 0);
+        addThread(r, s, a, r.entry, input, 0);
         var sp: usize = 0;
         while (true) {
             const count = s.count[a];

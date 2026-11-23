@@ -603,21 +603,108 @@ const Vm = struct {
     fn doCall(vm: *Vm, inst: Inst) stdlib.Error!void {
         const arity: usize = inst.b;
         const fid: stdlib.FnId = @enumFromInt(inst.a);
-        // Fast path for equality (the most common operator).
-        if ((fid == .eq or fid == .ne) and arity == 2) {
-            const b = vm.pop();
-            const a = vm.pop();
-            if (a == .err) {
+        // Fast paths for the common operators: equality and int ordering.
+        if (arity == 2) {
+            if (fid == .eq or fid == .ne) {
+                const b = vm.pop();
+                const a = vm.pop();
+                if (a == .err) {
+                    vm.push(a);
+                    return;
+                }
+                if (b == .err) {
+                    vm.push(b);
+                    return;
+                }
+                const eq = Value.eql(a.val, b.val);
+                vm.push(.{ .val = .{ .bool_t = if (fid == .eq) eq else !eq } });
+                return;
+            }
+            if ((fid == .lt or fid == .le or fid == .gt or fid == .ge) and
+                vm.prog.stack[vm.sp - 1] == .val and vm.prog.stack[vm.sp - 2] == .val and
+                vm.prog.stack[vm.sp - 1].val == .int_t and vm.prog.stack[vm.sp - 2].val == .int_t)
+            {
+                const y = vm.prog.stack[vm.sp - 1].val.int_t;
+                const x = vm.prog.stack[vm.sp - 2].val.int_t;
+                vm.sp -= 2;
+                const result = switch (fid) {
+                    .lt => x < y,
+                    .le => x <= y,
+                    .gt => x > y,
+                    .ge => x >= y,
+                    else => unreachable,
+                };
+                vm.push(.{ .val = .{ .bool_t = result } });
+                return;
+            }
+            // String function fast paths.
+            if (fid == .contains or fid == .starts_with or fid == .ends_with) {
+                const b = vm.pop();
+                const a = vm.pop();
+                if (a == .err) {
+                    vm.push(a);
+                    return;
+                }
+                if (b == .err) {
+                    vm.push(b);
+                    return;
+                }
+                if (a.val == .string_t and b.val == .string_t) {
+                    const hay = a.val.string_t;
+                    const needle = b.val.string_t;
+                    const result = switch (fid) {
+                        .contains => needle.len == 0 or (needle.len <= hay.len and std.mem.indexOf(u8, hay, needle) != null),
+                        .starts_with => std.mem.startsWith(u8, hay, needle),
+                        .ends_with => std.mem.endsWith(u8, hay, needle),
+                        else => unreachable,
+                    };
+                    vm.push(.{ .val = .{ .bool_t = result } });
+                    return;
+                }
+                // Non-string: fall through to the slow path for the proper
+                // error, with operands restored.
                 vm.push(a);
-                return;
-            }
-            if (b == .err) {
                 vm.push(b);
-                return;
+            } else if (fid == .size and vm.sp >= 1 and vm.prog.stack[vm.sp - 1] == .val) {
+                const v = vm.prog.stack[vm.sp - 1].val;
+                const n: ?i64 = switch (v) {
+                    .list_t => |l| @intCast(l.len),
+                    .bytes_t => |s| @intCast(s.len),
+                    .string_t => |s| blk: {
+                        // Code point count.
+                        var count: i64 = 0;
+                        var i: usize = 0;
+                        while (i < s.len) {
+                            const l = std.unicode.utf8ByteSequenceLength(s[i]) catch break :blk null;
+                            i += l;
+                            count += 1;
+                        }
+                        break :blk count;
+                    },
+                    else => null,
+                };
+                if (n) |count| {
+                    vm.sp -= 1;
+                    vm.push(.{ .val = .{ .int_t = count } });
+                    return;
+                }
+            } else if (fid == .in and vm.prog.stack[vm.sp - 1] == .val and vm.prog.stack[vm.sp - 2] == .val) {
+                // List membership fast path.
+                const container = vm.prog.stack[vm.sp - 1].val;
+                if (container == .list_t) {
+                    const needle = vm.prog.stack[vm.sp - 2].val;
+                    var found = false;
+                    for (container.list_t) |item| {
+                        if (Value.eql(needle, item)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    vm.sp -= 2;
+                    vm.push(.{ .val = .{ .bool_t = found } });
+                    return;
+                }
             }
-            const eq = Value.eql(a.val, b.val);
-            vm.push(.{ .val = .{ .bool_t = if (fid == .eq) eq else !eq } });
-            return;
         }
         var failed: ?StackVal = null;
         for (0..arity) |i| {
@@ -718,8 +805,10 @@ const Vm = struct {
                 vm.push(.{ .val = .{ .bool_t = count == 1 } });
             },
             .macro_filter => {
-                var out = std.ArrayList(Value){};
-                defer out.deinit(vm.ctx.alloc);
+                // At most range.len elements survive; the over-allocation
+                // lives in the run arena, so no shrink-copy is needed.
+                const items = vm.ctx.alloc.alloc(Value, range.len) catch return error.OutOfMemory;
+                var n: usize = 0;
                 for (range) |item| {
                     vm.prog.locals[info.var_slot] = item;
                     const p = try vm.subrun(info.pred_start, info.pred_end);
@@ -730,7 +819,10 @@ const Vm = struct {
                                 vm.pushCtxError();
                                 return;
                             }
-                            if (v.bool_t) out.append(vm.ctx.alloc, item) catch return error.OutOfMemory;
+                            if (v.bool_t) {
+                                items[n] = item;
+                                n += 1;
+                            }
                         },
                         .err => {
                             vm.push(p);
@@ -738,12 +830,15 @@ const Vm = struct {
                         },
                     }
                 }
-                const items = vm.ctx.alloc.dupe(Value, out.items) catch return error.OutOfMemory;
-                vm.push(.{ .val = .{ .list_t = items } });
+                vm.push(.{ .val = .{ .list_t = items[0..n] } });
             },
             .macro_map, .macro_map3 => {
-                var out = std.ArrayList(Value){};
-                defer out.deinit(vm.ctx.alloc);
+                // The two-argument map uses the "predicate" range as the
+                // transform; the three-argument form filters first. At most
+                // range.len results; the over-allocation lives in the run
+                // arena.
+                const out = vm.ctx.alloc.alloc(Value, range.len) catch return error.OutOfMemory;
+                var n: usize = 0;
                 // The two-argument map uses the "predicate" range as the
                 // transform; the three-argument form filters first.
                 const t_start = if (inst.op == .macro_map3) info.transform_start else info.pred_start;
@@ -769,15 +864,17 @@ const Vm = struct {
                     }
                     const t = try vm.subrun(t_start, t_end);
                     switch (t) {
-                        .val => |v| out.append(vm.ctx.alloc, v) catch return error.OutOfMemory,
+                        .val => |v| {
+                            out[n] = v;
+                            n += 1;
+                        },
                         .err => {
                             vm.push(t);
                             return;
                         },
                     }
                 }
-                const items = vm.ctx.alloc.dupe(Value, out.items) catch return error.OutOfMemory;
-                vm.push(.{ .val = .{ .list_t = items } });
+                vm.push(.{ .val = .{ .list_t = out[0..n] } });
             },
             else => unreachable,
         }
