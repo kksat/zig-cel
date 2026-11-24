@@ -265,13 +265,20 @@ pub const Ctx = struct {
     }
 
     pub fn noOverload(c: *Ctx, id: FnId, args: []const Value) Error {
+        return c.noOverloadNamed(fnName(id), args);
+    }
+
+    /// The no-overload error for host-provided functions (which have no
+    /// FnId); produces the same "no_matching_overload" shape as standard
+    /// functions.
+    pub fn noOverloadNamed(c: *Ctx, name: []const u8, args: []const Value) Error {
         var aw = std.Io.Writer.Allocating.init(c.alloc);
         const w = &aw.writer;
         for (args, 0..) |a, i| {
             if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
             w.writeAll(a.typeOf().name()) catch return error.OutOfMemory;
         }
-        c.err_msg = std.fmt.allocPrint(c.alloc, "no_matching_overload: found no matching overload for '{s}' applied to '({s})'", .{ fnName(id), aw.written() }) catch "out of memory";
+        c.err_msg = std.fmt.allocPrint(c.alloc, "no_matching_overload: found no matching overload for '{s}' applied to '({s})'", .{ name, aw.written() }) catch "out of memory";
         c.unbound = false;
         return error.Eval;
     }

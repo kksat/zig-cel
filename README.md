@@ -151,6 +151,41 @@ range counts in full, so short-circuited branches count their untaken side
 — which keeps limit enforcement off the hot evaluation loop (benchmarks
 are unchanged without limits).
 
+## Host functions
+
+Applications can register native functions, like cel-go's
+`cel.Function("name", ..., cel.FunctionBinding(...))`. Functions are
+registered by name at compile time and resolved only for names the
+standard library does not define (standard names take precedence and
+cannot be overridden):
+
+```zig
+const cel = @import("cel");
+
+// The binding receives every argument and does its own arity/type
+// dispatch, like a cel-go function-level FunctionBinding. Results are
+// constructed in the run arena via ctx.alloc.
+fn twice(ctx: *cel.stdlib.Ctx, args: []const cel.vm.Value) cel.stdlib.Error!cel.vm.Value {
+    if (args.len != 1 or args[0] != .int_t) {
+        return ctx.noOverloadNamed("twice", args);
+    }
+    return .{ .int_t = args[0].int_t * 2 };
+}
+
+const prog = try cel.vm.Compiler.compile(a, tree, .{
+    .host = &.{.{ .name = "twice", .func = &twice }},
+});
+// twice(21) == 42, x.twice() == 2 * x (e.f() is sugar for f(e))
+```
+
+Semantics follow the standard functions: host errors reported via
+`ctx.fail` / `ctx.noOverloadNamed` become CEL error values (absorbed by
+`&&`/`||`), host calls are usable anywhere a standard call is (macros,
+receiver position), and they are not constant-folded. The `host` slice is
+borrowed: it must outlive the compiled Program. Host functions are
+host-trusted code: they are not covered by `RunOptions` budgets or
+cancellation, and must terminate on their own.
+
 ## Status
 
 - Lexer / parser: full CEL grammar including raw, triple-quoted, and bytes

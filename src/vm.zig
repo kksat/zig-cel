@@ -30,6 +30,26 @@ pub const Value = value_mod.Value;
 pub const Map = value_mod.Map;
 pub const Binding = stdlib.Binding;
 
+/// Implementation of a host-provided function, mirroring cel-go's
+/// function-level `cel.FunctionBinding` (which receives every argument and
+/// is responsible for its own arity/type dispatch): `args` are the call's
+/// operands, `ctx` carries the run's arena (for constructing result
+/// values) and the error-reporting helpers. Signal evaluation errors with
+/// `ctx.fail` / `ctx.noOverloadNamed` (they become absorbable CEL error
+/// values, like standard-function errors). Host functions are host-trusted
+/// code: unlike expressions they are not covered by RunOptions budgets or
+/// cancellation, and must terminate on their own.
+pub const HostFunc = fn (ctx: *stdlib.Ctx, args: []const Value) stdlib.Error!Value;
+
+/// A host-provided function registered under a name (like cel-go's
+/// `cel.Function("double", ..., cel.FunctionBinding(...))`), resolved for
+/// call names the standard library does not define. The struct is borrowed
+/// by compiled programs and must outlive them.
+pub const HostFn = struct {
+    name: []const u8,
+    func: *const HostFunc,
+};
+
 pub const Error = error{ Compile, OutOfMemory };
 
 /// Errors from `Program.run`: allocation failure, exceeding the optional
@@ -95,6 +115,9 @@ pub const Op = enum(u8) {
     select_qualified,
     /// a: function id, b: arity. Pops args; propagates error args.
     call,
+    /// a: host function index, b: arity. Pops args; propagates error
+    /// args; invokes the registered host function.
+    call_host,
     /// a: regex pool index. Pops input string.
     matches_const,
     /// a: target.
@@ -161,6 +184,8 @@ pub const Program = struct {
     backing: std.mem.Allocator,
     /// Enabled extensions for dispatch.
     ext: ext.Extensions = .{},
+    /// Host-provided functions (borrowed from CompileOptions).
+    host: []const HostFn = &.{},
     insts: []Inst,
     consts: []Value,
     names: [][]const u8,
@@ -407,6 +432,10 @@ const Vm = struct {
                 },
                 .call => {
                     try vm.doCall(inst);
+                    pc += 1;
+                },
+                .call_host => {
+                    try vm.doHostCall(inst);
                     pc += 1;
                 },
                 .matches_const => {
@@ -807,6 +836,37 @@ const Vm = struct {
         vm.push(.{ .val = result });
     }
 
+    /// Invoke a host-provided function. Error-argument propagation and
+    /// error-value semantics mirror the standard call path: host errors
+    /// (error.Eval via ctx.fail/noOverloadNamed) become absorbable error
+    /// values.
+    fn doHostCall(vm: *Vm, inst: Inst) ExecError!void {
+        const arity: usize = inst.b;
+        var failed: ?StackVal = null;
+        for (0..arity) |i| {
+            const sv = vm.prog.stack[vm.sp - arity + i];
+            if (sv == .err) {
+                if (failed == null) failed = sv;
+            } else {
+                vm.prog.args_buf[i] = sv.val;
+            }
+        }
+        vm.sp -= arity;
+        if (failed) |f| {
+            vm.push(f);
+            return;
+        }
+        const hf = vm.prog.host[inst.a];
+        const result = hf.func(&vm.ctx, vm.prog.args_buf[0..arity]) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Eval => {
+                vm.push(.{ .err = .{ .msg = vm.ctx.err_msg, .unbound = vm.ctx.unbound } });
+                return;
+            },
+        };
+        vm.push(.{ .val = result });
+    }
+
     fn doMacro(vm: *Vm, inst: Inst) ExecError!void {
         const info = vm.prog.macros[inst.a];
         const range_val = vm.pop();
@@ -980,6 +1040,11 @@ const ScopeEntry = struct {
 pub const CompileOptions = struct {
     /// Enabled extensions; dispatched functions are gated on this set.
     ext: ext.Extensions = .{},
+    /// Host-provided functions (see HostFn), resolved for call names the
+    /// standard library does not define; standard names take precedence
+    /// and cannot be overridden. The slice is borrowed: it must outlive
+    /// the compiled Program.
+    host: []const HostFn = &.{},
 };
 
 pub const Compiler = struct {
@@ -1061,6 +1126,14 @@ pub const Compiler = struct {
         try c.chains.append(c.alloc, chain);
         try c.chain_abs.append(c.alloc, abs);
         return @intCast(c.chains.items.len - 1);
+    }
+
+    /// Index of a host function by name, if registered.
+    fn hostIndexOf(c: *Compiler, name: []const u8) ?u32 {
+        for (c.options.host, 0..) |hf, i| {
+            if (std.mem.eql(u8, hf.name, name)) return @intCast(i);
+        }
+        return null;
     }
 
     fn addRegex(c: *Compiler, pattern: []const u8) Error!?u32 {
@@ -1215,6 +1288,15 @@ pub const Compiler = struct {
                 c.popDepth(kids.len);
                 if (kids.len > c.max_arity) c.max_arity = kids.len;
                 if (fid == .unknown) {
+                    // Host-provided function: dispatch through the host
+                    // table (interned at compile time; no name lookup at
+                    // eval time). Not constant-folded: host functions are
+                    // not assumed pure.
+                    if (c.hostIndexOf(n.payload.str)) |hi| {
+                        try c.emit(.{ .op = .call_host, .a = hi, .b = @intCast(kids.len) });
+                        c.pushDepth();
+                        return;
+                    }
                     // Unknown function: runtime error carrying the name.
                     const msg = std.fmt.allocPrint(c.alloc, "unbound function: '{s}' is not defined", .{n.payload.str}) catch return error.OutOfMemory;
                     const msg_idx = try c.addConst(.{ .string_t = msg });
@@ -1407,6 +1489,7 @@ pub const Compiler = struct {
 
         prog.backing = alloc;
         prog.ext = c.options.ext;
+        prog.host = c.options.host;
         prog.insts = c.insts.toOwnedSlice(alloc) catch return error.OutOfMemory;
         prog.consts = c.consts.toOwnedSlice(alloc) catch return error.OutOfMemory;
         prog.names = c.names.toOwnedSlice(alloc) catch return error.OutOfMemory;
@@ -1439,9 +1522,9 @@ const tests = struct {
     const parser = @import("parser.zig");
 
     /// Parse, compile, run, and format; returns the display form (copied
-    /// into test memory) or null on any error. The arena is released before
+    /// `twice` binding on int. test memory) or null on any error. The arena is released before
     /// returning.
-    fn evalToDisplay(src: []const u8, vars: []const Binding) !?[]const u8 {
+    fn evalOpts(src: []const u8, vars: []const Binding, opts: CompileOptions) !?[]const u8 {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const r = try parser.parseSrc(arena.allocator(), src, .{});
@@ -1452,7 +1535,7 @@ const tests = struct {
                 return null;
             },
         };
-        const prog = try Compiler.compile(arena.allocator(), tree, .{});
+        const prog = try Compiler.compile(arena.allocator(), tree, opts);
         const result = try prog.run(arena.allocator(), vars, "", .{});
         const v = switch (result) {
             .value => |v| v,
@@ -1466,10 +1549,42 @@ const tests = struct {
         return try testing.allocator.dupe(u8, aw.written());
     }
 
+    fn evalToDisplay(src: []const u8, vars: []const Binding) !?[]const u8 {
+        return evalOpts(src, vars, .{});
+    }
+
     fn check(expr: []const u8, want: []const u8, vars: []const Binding) !void {
         const got = (try evalToDisplay(expr, vars)) orelse return error.TestUnexpectedResult;
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(want, got);
+    }
+
+    fn checkHost(expr: []const u8, want: []const u8, vars: []const Binding, host: []const HostFn) !void {
+        const got = (try evalOpts(expr, vars, .{ .host = host })) orelse return error.TestUnexpectedResult;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    /// cel-go's canonical custom-function example, on a non-stdlib name: a
+    /// `twice` binding on int.
+    fn hostTwice(ctx: *stdlib.Ctx, args: []const Value) stdlib.Error!Value {
+        if (args.len != 1 or args[0] != .int_t) return ctx.noOverloadNamed("twice", args);
+        return .{ .int_t = args[0].int_t * 2 };
+    }
+
+    /// A host function that signals an evaluation error.
+    fn hostFail(ctx: *stdlib.Ctx, args: []const Value) stdlib.Error!Value {
+        _ = args;
+        return ctx.fail("host boom", .{});
+    }
+
+    /// A host function constructing a value in the run arena.
+    fn hostMakePair(ctx: *stdlib.Ctx, args: []const Value) stdlib.Error!Value {
+        if (args.len != 2) return ctx.noOverloadNamed("makePair", args);
+        const items = try ctx.alloc.alloc(Value, 2);
+        items[0] = args[0];
+        items[1] = args[1];
+        return .{ .list_t = items };
     }
 
     test "vm basics" {
@@ -1543,6 +1658,53 @@ const tests = struct {
         try check("[1, 2] + [3]", "[1, 2, 3]", &.{});
         try check("size([1, 2, 3])", "3", &.{});
         try check("{1: 2}[1]", "2", &.{});
+    }
+
+    test "vm host functions" {
+        const host = [_]HostFn{
+            .{ .name = "twice", .func = &hostTwice },
+            .{ .name = "hostFail", .func = &hostFail },
+            .{ .name = "makePair", .func = &hostMakePair },
+        };
+        const vars = [_]Binding{.{ .name = "x", .value = .{ .int_t = 5 } }};
+
+        // Global and receiver-style calls (e.f() is sugar for f(e)).
+        try checkHost("twice(21)", "42", &.{}, &host);
+        try checkHost("x.twice()", "10", &vars, &host);
+        // Usable everywhere a standard function is, including macros and
+        // operator expressions.
+        try checkHost("[1, 2, 3].map(x, twice(x))", "[2, 4, 6]", &.{}, &host);
+        try checkHost("twice(x) == 10", "true", &vars, &host);
+        // Host-constructed values live in the run arena like any other.
+        try checkHost("size(makePair(1, 2))", "2", &.{}, &host);
+
+        // Host errors are CEL error values: absorbed by && / || like
+        // standard-function errors.
+        try checkHost("hostFail() && false", "false", &.{}, &host);
+        try checkHost("hostFail() || true", "true", &.{}, &host);
+        try testing.expect((try evalOpts("hostFail()", &.{}, .{ .host = &host })) == null);
+
+        // Wrong arity: no_matching_overload, shaped like the standard
+        // dispatcher's error.
+        {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const r = try parser.parseSrc(a, "twice(1, 2)", .{});
+            const prog = try Compiler.compile(a, r.ok, .{ .host = &host });
+            const result = try prog.run(a, &.{}, "", .{});
+            switch (result) {
+                .err => |e| try testing.expect(std.mem.indexOf(u8, e, "no_matching_overload: found no matching overload for 'twice' applied to '(int, int)'") != null),
+                .value => return error.TestUnexpectedResult,
+            }
+        }
+
+        // Standard names take precedence and cannot be overridden.
+        try checkHost("size([1, 2])", "2", &.{}, &.{.{ .name = "size", .func = &hostTwice }});
+        // Unregistered names still fail as unbound functions.
+        try testing.expect((try evalOpts("nosuch(1)", &.{}, .{ .host = &host })) == null);
+        // Without registration, `twice` is unbound too.
+        try testing.expect((try evalOpts("twice(21)", &.{}, .{})) == null);
     }
 
     test "vm run budget and cancellation" {
