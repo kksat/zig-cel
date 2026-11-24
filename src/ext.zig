@@ -1301,7 +1301,7 @@ const tests = struct {
             },
         };
         const prog = try vm.Compiler.compile(a, tree, .{ .ext = ext });
-        const result = try prog.run(a, &.{}, "");
+        const result = try prog.run(a, &.{}, "", .{});
         const v = switch (result) {
             .value => |v| v,
             .err => |e| {

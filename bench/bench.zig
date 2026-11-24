@@ -201,7 +201,7 @@ pub fn main() !void {
 
         // Warmup + correctness check.
         var warm_arena = std.heap.ArenaAllocator.init(alloc);
-        const first = prog.run(warm_arena.allocator(), vars, "") catch {
+        const first = prog.run(warm_arena.allocator(), vars, "", .{}) catch {
             try w.print("{s:<22} RUN ERROR\n", .{case.name});
             continue;
         };
@@ -231,7 +231,7 @@ pub fn main() !void {
             var j: usize = 0;
             while (j < batch) : (j += 1) {
                 _ = run_arena.reset(.retain_capacity);
-                _ = prog.run(run_arena.allocator(), vars, "") catch {};
+                _ = prog.run(run_arena.allocator(), vars, "", .{}) catch {};
             }
             times[b] = timer.read() / batch;
             total_allocs += counting.allocs;

@@ -102,7 +102,7 @@ pub fn main() !void {
         std.debug.print("compile error\n", .{});
         std.process.exit(1);
     };
-    const v = switch (try prog.run(a, bindings.items, "")) {
+    const v = switch (try prog.run(a, bindings.items, "", .{})) {
         .value => |v| v,
         .err => |e| {
             std.debug.print("error: {s}\n", .{e});

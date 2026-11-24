@@ -194,7 +194,7 @@ fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: 
         std.debug.print("FAIL {s}: compile error\n  expr: {s}\n", .{ label, t.expr });
         return;
     };
-    const result = prog.run(a, bindings.items, t.container) catch {
+    const result = prog.run(a, bindings.items, t.container, .{}) catch {
         stats.failed += 1;
         std.debug.print("FAIL {s}: out of memory\n  expr: {s}\n", .{ label, t.expr });
         return;

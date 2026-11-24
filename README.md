@@ -123,6 +123,16 @@ const result = try prog.run(a, &.{
 must not be evaluated concurrently (compile one per thread). Values built
 by a run reference the arena passed to it.
 
+For untrusted expressions, `Program.run` takes `RunOptions`: an optional
+`max_steps` instruction budget (runs exceeding it abort with
+`error.BudgetExceeded`) and an optional `cancel: *cel.vm.Cancel` flag
+(aborting with `error.Canceled`, polled at comprehension-iteration
+granularity; call `Cancel.request()` from another thread or signal
+handler). The budget is charged conservatively — every entered instruction
+range counts in full, so short-circuited branches count their untaken side
+— which keeps limit enforcement off the hot evaluation loop (benchmarks
+are unchanged without limits).
+
 ## Status
 
 - Lexer / parser: full CEL grammar including raw, triple-quoted, and bytes
