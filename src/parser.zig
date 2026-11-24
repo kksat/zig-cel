@@ -154,6 +154,13 @@ pub const Parser = struct {
         if (p.pos + 1 < p.toks.len) p.pos += 1;
     }
 
+    /// Byte offset one past the last consumed token. The parser never
+    /// advances past the eof token, so `pos - 1` is always the most
+    /// recently consumed real token.
+    fn prevEnd(p: *P) u32 {
+        return p.toks[p.pos - 1].end;
+    }
+
     fn expect(p: *P, kind: token.TokenKind, what: []const u8) Error!token.Token {
         const t = p.cur();
         if (t.kind != kind) {
@@ -183,13 +190,13 @@ pub const Parser = struct {
     }
 
     fn binary(p: *P, kind: ast.Kind, lhs: NodeIndex, rhs: NodeIndex, start: u32) Error!NodeIndex {
-        const n = try p.addNode(.{ .kind = kind, .start = start });
+        const n = try p.addNode(.{ .kind = kind, .start = start, .end = p.prevEnd() });
         try p.setChildren(n, &.{ lhs, rhs });
         return n;
     }
 
     fn call(p: *P, name: []const u8, args: []const NodeIndex, start: u32, receiver: bool) Error!NodeIndex {
-        const n = try p.addNode(.{ .kind = .call, .start = start, .payload = .{ .str = name } });
+        const n = try p.addNode(.{ .kind = .call, .start = start, .end = p.prevEnd(), .payload = .{ .str = name } });
         if (receiver) p.nodes.items[n].flags.receiver = true;
         try p.setChildren(n, args);
         return n;
@@ -205,7 +212,7 @@ pub const Parser = struct {
             const then = try p.parseOr();
             _ = try p.expect(.colon, "expected ':' in conditional expression");
             const els = try p.parseExpr();
-            const n = try p.addNode(.{ .kind = .ternary, .start = start });
+            const n = try p.addNode(.{ .kind = .ternary, .start = start, .end = p.prevEnd() });
             try p.setChildren(n, &.{ cond, then, els });
             return n;
         }
@@ -215,7 +222,7 @@ pub const Parser = struct {
     fn parseOr(p: *P) Error!NodeIndex {
         var lhs = try p.parseAnd();
         while (p.cur().kind == .or_op) {
-            const start = p.cur().start;
+            const start = p.nodes.items[lhs].start;
             p.advance();
             const rhs = try p.parseAnd();
             lhs = try p.binary(.or_, lhs, rhs, start);
@@ -226,7 +233,7 @@ pub const Parser = struct {
     fn parseAnd(p: *P) Error!NodeIndex {
         var lhs = try p.parseRelation();
         while (p.cur().kind == .and_op) {
-            const start = p.cur().start;
+            const start = p.nodes.items[lhs].start;
             p.advance();
             const rhs = try p.parseRelation();
             lhs = try p.binary(.and_, lhs, rhs, start);
@@ -249,8 +256,9 @@ pub const Parser = struct {
                 else => break,
             };
             p.advance();
+            const start = p.nodes.items[lhs].start;
             const rhs = try p.parseAddition();
-            lhs = try p.call(name, &.{ lhs, rhs }, t.start, false);
+            lhs = try p.call(name, &.{ lhs, rhs }, start, false);
         }
         return lhs;
     }
@@ -265,8 +273,9 @@ pub const Parser = struct {
                 else => break,
             };
             p.advance();
+            const start = p.nodes.items[lhs].start;
             const rhs = try p.parseMultiplication();
-            lhs = try p.call(name, &.{ lhs, rhs }, t.start, false);
+            lhs = try p.call(name, &.{ lhs, rhs }, start, false);
         }
         return lhs;
     }
@@ -282,8 +291,9 @@ pub const Parser = struct {
                 else => break,
             };
             p.advance();
+            const start = p.nodes.items[lhs].start;
             const rhs = try p.parseUnary();
-            lhs = try p.call(name, &.{ lhs, rhs }, t.start, false);
+            lhs = try p.call(name, &.{ lhs, rhs }, start, false);
         }
         return lhs;
     }
@@ -294,11 +304,14 @@ pub const Parser = struct {
             .not => {
                 p.advance();
                 const operand = try p.parseUnary();
-                // Fold double negation.
+                // Fold double negation; the surviving child's span is
+                // widened to cover both `!`s.
                 if (p.nodes.items[operand].kind == .not) {
-                    return p.childOf(operand);
+                    const child = p.childOf(operand);
+                    p.nodes.items[child].start = t.start;
+                    return child;
                 }
-                const n = try p.addNode(.{ .kind = .not, .start = t.start });
+                const n = try p.addNode(.{ .kind = .not, .start = t.start, .end = p.prevEnd() });
                 try p.setChildren(n, &.{operand});
                 return n;
             },
@@ -309,26 +322,28 @@ pub const Parser = struct {
                 if (nt.kind == .int_lit) {
                     if (nt.overflow and nt.num.uint == @as(u64, 1) << 63) {
                         p.advance();
-                        return p.addNode(.{ .kind = .int, .start = t.start, .payload = .{ .int = std.math.minInt(i64) } });
+                        return p.addNode(.{ .kind = .int, .start = t.start, .end = nt.end, .payload = .{ .int = std.math.minInt(i64) } });
                     }
                     if (!nt.overflow) {
                         p.advance();
-                        return p.addNode(.{ .kind = .int, .start = t.start, .payload = .{ .int = -nt.num.int } });
+                        return p.addNode(.{ .kind = .int, .start = t.start, .end = nt.end, .payload = .{ .int = -nt.num.int } });
                     }
                 }
                 const operand = try p.parseUnary();
                 if (p.nodes.items[operand].kind == .neg) {
                     return p.childOf(operand);
                 }
-                // Fold negation of an int literal (e.g. `--5` -> 5).
+                // Fold negation of an int literal (e.g. `--5` -> 5); the
+                // literal's span is widened to cover both `-`s.
                 if (p.nodes.items[operand].kind == .int) {
                     const v = p.nodes.items[operand].payload.int;
                     if (v != std.math.minInt(i64)) {
                         p.nodes.items[operand].payload.int = -v;
+                        p.nodes.items[operand].start = t.start;
                         return operand;
                     }
                 }
-                const n = try p.addNode(.{ .kind = .neg, .start = t.start });
+                const n = try p.addNode(.{ .kind = .neg, .start = t.start, .end = p.prevEnd() });
                 try p.setChildren(n, &.{operand});
                 return n;
             },
@@ -355,23 +370,24 @@ pub const Parser = struct {
                     // in this position per the spec.
                     if (p.cur().kind == .lparen) {
                         const args = try p.parseArgList();
-                        if (try p.maybeMacro(e, ft, args, t.start)) |m| {
+                        const recv_start = p.nodes.items[e].start;
+                        if (try p.maybeMacro(e, ft, args, recv_start)) |m| {
                             e = m;
                         } else if (p.qualifiedFunctionName(e, ft.text)) |dotted| {
                             // Namespaced extension function (math.ceil,
                             // strings.quote): a global call with the dotted
                             // name, mirroring cel-go's checker resolution.
-                            e = try p.call(dotted, args, t.start, false);
+                            e = try p.call(dotted, args, recv_start, false);
                         } else {
                             // The receiver becomes the first argument.
                             const kids = try p.alloc.alloc(NodeIndex, args.len + 1);
                             kids[0] = e;
                             @memcpy(kids[1..], args);
-                            e = try p.call(ft.text, kids, t.start, true);
+                            e = try p.call(ft.text, kids, recv_start, true);
                         }
                         continue;
                     }
-                    const sel = try p.addNode(.{ .kind = .select, .start = t.start, .payload = .{ .str = ft.text } });
+                    const sel = try p.addNode(.{ .kind = .select, .start = p.nodes.items[e].start, .end = ft.end, .payload = .{ .str = ft.text } });
                     try p.setChildren(sel, &.{e});
                     e = sel;
                 },
@@ -379,7 +395,7 @@ pub const Parser = struct {
                     p.advance();
                     const idx = try p.parseExpr();
                     _ = try p.expect(.rbracket, "expected ']' to close index expression");
-                    e = try p.call(ops.index, &.{ e, idx }, t.start, false);
+                    e = try p.call(ops.index, &.{ e, idx }, p.nodes.items[e].start, false);
                 },
                 else => break,
             }
@@ -475,7 +491,7 @@ pub const Parser = struct {
         if (var_node.flags.abs) return null;
 
         const m = mkind.?;
-        const n = try p.addNode(.{ .kind = .macro, .start = start, .payload = .{ .macro = m } });
+        const n = try p.addNode(.{ .kind = .macro, .start = start, .end = p.prevEnd(), .payload = .{ .macro = m } });
         var kids = std.ArrayList(NodeIndex){};
         defer kids.deinit(p.alloc);
         try kids.append(p.alloc, args[0]); // iteration variable (ident node)
@@ -509,7 +525,7 @@ pub const Parser = struct {
             },
             else => {
                 try p.checkNumericArgs(macro_name, args);
-                const list = try p.addNode(.{ .kind = .list, .start = start });
+                const list = try p.addNode(.{ .kind = .list, .start = start, .end = p.prevEnd() });
                 try p.setChildren(list, args);
                 return p.call(fn_name, &.{list}, start, false);
             },
@@ -559,40 +575,44 @@ pub const Parser = struct {
             .int_lit => {
                 p.advance();
                 if (t.overflow) return p.fail(t.start, "int literal out of range");
-                return p.addNode(.{ .kind = .int, .start = t.start, .payload = .{ .int = t.num.int } });
+                return p.addNode(.{ .kind = .int, .start = t.start, .end = t.end, .payload = .{ .int = t.num.int } });
             },
             .uint_lit => {
                 p.advance();
-                return p.addNode(.{ .kind = .uint, .start = t.start, .payload = .{ .uint = t.num.uint } });
+                return p.addNode(.{ .kind = .uint, .start = t.start, .end = t.end, .payload = .{ .uint = t.num.uint } });
             },
             .double_lit => {
                 p.advance();
-                return p.addNode(.{ .kind = .double, .start = t.start, .payload = .{ .double = t.num.double } });
+                return p.addNode(.{ .kind = .double, .start = t.start, .end = t.end, .payload = .{ .double = t.num.double } });
             },
             .string_lit => {
                 p.advance();
-                return p.addNode(.{ .kind = .string, .start = t.start, .payload = .{ .str = t.str } });
+                return p.addNode(.{ .kind = .string, .start = t.start, .end = t.end, .payload = .{ .str = t.str } });
             },
             .bytes_lit => {
                 p.advance();
-                return p.addNode(.{ .kind = .bytes, .start = t.start, .payload = .{ .str = t.str } });
+                return p.addNode(.{ .kind = .bytes, .start = t.start, .end = t.end, .payload = .{ .str = t.str } });
             },
             .true_kw => {
                 p.advance();
-                return p.addNode(.{ .kind = .bool_, .start = t.start, .payload = .{ .int = 1 } });
+                return p.addNode(.{ .kind = .bool_, .start = t.start, .end = t.end, .payload = .{ .int = 1 } });
             },
             .false_kw => {
                 p.advance();
-                return p.addNode(.{ .kind = .bool_, .start = t.start, .payload = .{ .int = 0 } });
+                return p.addNode(.{ .kind = .bool_, .start = t.start, .end = t.end, .payload = .{ .int = 0 } });
             },
             .null_kw => {
                 p.advance();
-                return p.addNode(.{ .kind = .null_, .start = t.start });
+                return p.addNode(.{ .kind = .null_, .start = t.start, .end = t.end });
             },
             .lparen => {
                 p.advance();
                 const e = try p.parseExpr();
                 _ = try p.expect(.rparen, "expected ')' to close group");
+                // Widen the inner expression's span to cover the
+                // parentheses: the node represents this whole occurrence.
+                p.nodes.items[e].start = t.start;
+                p.nodes.items[e].end = p.prevEnd();
                 return e;
             },
             .lbracket => return p.parseListLiteral(),
@@ -633,6 +653,9 @@ pub const Parser = struct {
         var segments = std.ArrayList([]const u8){};
         defer segments.deinit(p.alloc);
         try segments.append(p.alloc, first.text);
+        var seg_ends = std.ArrayList(u32){};
+        defer seg_ends.deinit(p.alloc);
+        try seg_ends.append(p.alloc, first.end);
         while (p.cur().kind == .dot and p.peek(1).kind == .ident and !p.peek(1).is_reserved) {
             p.advance(); // '.'
             const seg = p.cur();
@@ -644,6 +667,7 @@ pub const Parser = struct {
                 break;
             }
             try segments.append(p.alloc, seg.text);
+            try seg_ends.append(p.alloc, seg.end);
             if (p.cur().kind == .lbrace) {
                 // Message construction with a qualified type name.
                 return p.parseStructLiteral(segments.items, abs, first.start);
@@ -656,30 +680,33 @@ pub const Parser = struct {
         }
 
         if (segments.items.len == 1) {
-            const n = try p.addNode(.{ .kind = .ident, .start = first.start, .payload = .{ .str = segments.items[0] } });
+            const n = try p.addNode(.{ .kind = .ident, .start = first.start, .end = first.end, .payload = .{ .str = segments.items[0] } });
             if (abs) p.nodes.items[n].flags.abs = true;
             return n;
         }
 
         // Build select chain.
-        const root = try p.addNode(.{ .kind = .ident, .start = first.start, .payload = .{ .str = segments.items[0] } });
+        const root = try p.addNode(.{ .kind = .ident, .start = first.start, .end = first.end, .payload = .{ .str = segments.items[0] } });
         if (abs) p.nodes.items[root].flags.abs = true;
         var e = root;
-        for (segments.items[1..]) |seg| {
-            const sel = try p.addNode(.{ .kind = .select, .start = first.start, .payload = .{ .str = seg } });
+        for (segments.items[1..], seg_ends.items[1..]) |seg, seg_end| {
+            const sel = try p.addNode(.{ .kind = .select, .start = first.start, .end = seg_end, .payload = .{ .str = seg } });
             try p.setChildren(sel, &.{e});
             e = sel;
         }
         return e;
     }
 
-    /// Expand `has(e.f)`: mark the select node as a presence test.
+    /// Expand `has(e.f)`: mark the select node as a presence test. The
+    /// select's span is widened to cover the whole `has(...)` call.
     fn expandHas(p: *P, arg: NodeIndex, start: u32) Error!NodeIndex {
         const n = p.nodes.items[arg];
         if (n.kind != .select or n.flags.test_only) {
             return p.fail(start, "invalid argument to has() macro: expected a field selection");
         }
         p.nodes.items[arg].flags.test_only = true;
+        p.nodes.items[arg].start = start;
+        p.nodes.items[arg].end = p.prevEnd();
         return arg;
     }
 
@@ -700,7 +727,7 @@ pub const Parser = struct {
             }
         }
         _ = try p.expect(.rbracket, "expected ']' to close list");
-        const n = try p.addNode(.{ .kind = .list, .start = start });
+        const n = try p.addNode(.{ .kind = .list, .start = start, .end = p.prevEnd() });
         try p.setChildren(n, elems.items);
         return n;
     }
@@ -726,7 +753,7 @@ pub const Parser = struct {
             }
         }
         _ = try p.expect(.rbrace, "expected '}' to close map");
-        const n = try p.addNode(.{ .kind = .map, .start = start });
+        const n = try p.addNode(.{ .kind = .map, .start = start, .end = p.prevEnd() });
         try p.setChildren(n, entries.items);
         return n;
     }
@@ -750,7 +777,7 @@ pub const Parser = struct {
                 p.advance();
                 _ = try p.expect(.colon, "expected ':' after field name");
                 const v = try p.parseExpr();
-                const fnode = try p.addNode(.{ .kind = .string, .start = ft.start, .payload = .{ .str = ft.text } });
+                const fnode = try p.addNode(.{ .kind = .string, .start = ft.start, .end = ft.end, .payload = .{ .str = ft.text } });
                 try entries.append(p.alloc, fnode);
                 try entries.append(p.alloc, v);
                 if (p.cur().kind == .comma) {
@@ -762,7 +789,7 @@ pub const Parser = struct {
             }
         }
         _ = try p.expect(.rbrace, "expected '}' to close message literal");
-        const n = try p.addNode(.{ .kind = .struct_, .start = start, .payload = .{ .str = try name.toOwnedSlice(p.alloc) } });
+        const n = try p.addNode(.{ .kind = .struct_, .start = start, .end = p.prevEnd(), .payload = .{ .str = try name.toOwnedSlice(p.alloc) } });
         try p.setChildren(n, entries.items);
         return n;
     }
@@ -982,6 +1009,113 @@ const tests = struct {
         const target = a.children(a.root)[0];
         try testing.expectEqual(ast.Kind.select, kindOf(a, target));
         try testing.expectEqualStrings("b", a.nodes[target].payload.str);
+    }
+
+    test "node spans" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        // Operator call nodes span the whole expression, not just the
+        // operator token.
+        {
+            const a = try parseOk(&arena, "1 + 2");
+            try testing.expectEqual(@as(u32, 0), a.nodes[a.root].start);
+            try testing.expectEqual(@as(u32, 5), a.nodes[a.root].end);
+            const lhs = a.children(a.root)[0];
+            const rhs = a.children(a.root)[1];
+            try testing.expectEqual(@as(u32, 0), a.nodes[lhs].start);
+            try testing.expectEqual(@as(u32, 1), a.nodes[lhs].end);
+            try testing.expectEqual(@as(u32, 4), a.nodes[rhs].start);
+            try testing.expectEqual(@as(u32, 5), a.nodes[rhs].end);
+        }
+        // Function call and its arguments.
+        {
+            const a = try parseOk(&arena, "size(items) > 3");
+            try testing.expectEqual(@as(u32, 0), a.nodes[a.root].start);
+            try testing.expectEqual(@as(u32, 15), a.nodes[a.root].end);
+            const call = a.children(a.root)[0];
+            try testing.expectEqual(@as(u32, 0), a.nodes[call].start);
+            try testing.expectEqual(@as(u32, 11), a.nodes[call].end);
+            const arg = a.children(call)[0];
+            try testing.expectEqual(@as(u32, 5), a.nodes[arg].start);
+            try testing.expectEqual(@as(u32, 10), a.nodes[arg].end);
+        }
+        // Parentheses widen the inner node's span; the outer operator
+        // starts at the opening parenthesis.
+        {
+            const a = try parseOk(&arena, "(1 + 2) * 3");
+            try testing.expectEqual(@as(u32, 0), a.nodes[a.root].start);
+            try testing.expectEqual(@as(u32, 11), a.nodes[a.root].end);
+            const lhs = a.children(a.root)[0];
+            try testing.expectEqual(@as(u32, 0), a.nodes[lhs].start);
+            try testing.expectEqual(@as(u32, 7), a.nodes[lhs].end);
+        }
+        // Ternary, macro, list, map.
+        {
+            const t = try parseOk(&arena, "a ? b : c");
+            try testing.expectEqual(@as(u32, 0), t.nodes[t.root].start);
+            try testing.expectEqual(@as(u32, 9), t.nodes[t.root].end);
+        }
+        {
+            const m = try parseOk(&arena, "[1, 2, 3].map(x, x * 2)");
+            try testing.expectEqual(ast.Kind.macro, kindOf(m, m.root));
+            try testing.expectEqual(@as(u32, 0), m.nodes[m.root].start);
+            try testing.expectEqual(@as(u32, 23), m.nodes[m.root].end);
+            const kids = m.children(m.root);
+            try testing.expectEqual(@as(u32, 14), m.nodes[kids[0]].start);
+            try testing.expectEqual(@as(u32, 15), m.nodes[kids[0]].end);
+            try testing.expectEqual(@as(u32, 0), m.nodes[kids[1]].start);
+            try testing.expectEqual(@as(u32, 9), m.nodes[kids[1]].end);
+            try testing.expectEqual(@as(u32, 17), m.nodes[kids[2]].start);
+            try testing.expectEqual(@as(u32, 22), m.nodes[kids[2]].end);
+        }
+        {
+            const mp = try parseOk(&arena, "{1: 'a'}");
+            try testing.expectEqual(@as(u32, 0), mp.nodes[mp.root].start);
+            try testing.expectEqual(@as(u32, 8), mp.nodes[mp.root].end);
+        }
+        // Receiver calls and select chains root at the receiver.
+        {
+            const r = try parseOk(&arena, "'abc'.contains('a')");
+            try testing.expectEqual(@as(u32, 0), r.nodes[r.root].start);
+            try testing.expectEqual(@as(u32, 19), r.nodes[r.root].end);
+            const recv = r.children(r.root)[0];
+            try testing.expectEqual(@as(u32, 0), r.nodes[recv].start);
+            try testing.expectEqual(@as(u32, 5), r.nodes[recv].end);
+        }
+        {
+            const s = try parseOk(&arena, "a.b[c].d");
+            try testing.expectEqual(@as(u32, 0), s.nodes[s.root].start);
+            try testing.expectEqual(@as(u32, 8), s.nodes[s.root].end);
+            const idx = s.children(s.root)[0];
+            try testing.expectEqual(@as(u32, 0), s.nodes[idx].start);
+            try testing.expectEqual(@as(u32, 6), s.nodes[idx].end);
+            const sel = s.children(idx)[0];
+            try testing.expectEqual(@as(u32, 0), s.nodes[sel].start);
+            try testing.expectEqual(@as(u32, 3), s.nodes[sel].end);
+        }
+        // has() widens the select to the whole macro call.
+        {
+            const h = try parseOk(&arena, "has(a.b)");
+            try testing.expect(h.nodes[h.root].flags.test_only);
+            try testing.expectEqual(@as(u32, 0), h.nodes[h.root].start);
+            try testing.expectEqual(@as(u32, 8), h.nodes[h.root].end);
+        }
+        // Unary folds keep the full extent.
+        {
+            const n = try parseOk(&arena, "--5");
+            try testing.expectEqual(ast.Kind.int, kindOf(n, n.root));
+            try testing.expectEqual(@as(u32, 0), n.nodes[n.root].start);
+            try testing.expectEqual(@as(u32, 3), n.nodes[n.root].end);
+            const b = try parseOk(&arena, "!!x");
+            try testing.expectEqual(ast.Kind.ident, kindOf(b, b.root));
+            try testing.expectEqual(@as(u32, 0), b.nodes[b.root].start);
+            try testing.expectEqual(@as(u32, 3), b.nodes[b.root].end);
+            const g = try parseOk(&arena, "-x");
+            try testing.expectEqual(ast.Kind.neg, kindOf(g, g.root));
+            try testing.expectEqual(@as(u32, 0), g.nodes[g.root].start);
+            try testing.expectEqual(@as(u32, 2), g.nodes[g.root].end);
+        }
     }
 
     test "deep nesting bounded" {

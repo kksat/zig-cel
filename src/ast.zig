@@ -78,6 +78,10 @@ pub const Node = struct {
     flags: Flags = .{},
     /// Byte offset of the first token of this expression in the source.
     start: u32 = 0,
+    /// Byte offset one past the last token of this expression in the
+    /// source (i.e. the span is [start, end); parenthesized expressions
+    /// include their parentheses).
+    end: u32 = 0,
     /// Index of the first child in the program's child table.
     child: u32 = 0,
     /// Number of children.
