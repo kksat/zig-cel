@@ -104,19 +104,37 @@ Then:
 const std = @import("std");
 const cel = @import("cel");
 
-var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-defer arena.deinit();
-const a = arena.allocator();
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-// Parse + compile once.
-const parsed = cel.parser.parseSrc(a, "size(items) > 3 && items[0] > 0", .{});
-const prog = try cel.vm.Compiler.compile(a, parsed.ok);
+    // Parse + compile once.
+    const parsed = try cel.parser.parseSrc(a, "size(items) > 3 && items[0] > 0", .{});
+    const tree = switch (parsed) {
+        .ok => |t| t,
+        .err => |e| {
+            std.debug.print("parse error: {s} (at byte {d})\n", .{ e.msg, e.pos });
+            return;
+        },
+    };
+    const prog = try cel.vm.Compiler.compile(a, tree, .{});
 
-// Evaluate many times (values constructed during the run live in the
-// caller-provided arena).
-const result = try prog.run(a, &.{
-    .{ .name = "items", .value = .{ .list_t = &items } },
-}, "");
+    // Evaluate many times (values constructed during the run live in the
+    // caller-provided arena).
+    const items = [_]cel.vm.Value{ .{ .int_t = 1 }, .{ .int_t = 2 }, .{ .int_t = 3 } };
+    const result = try prog.run(a, &.{
+        .{ .name = "items", .value = .{ .list_t = &items } },
+    }, "", .{});
+    switch (result) {
+        .value => |v| {
+            var aw = std.Io.Writer.Allocating.init(a);
+            try v.format(&aw.writer);
+            std.debug.print("{s}\n", .{aw.written()});
+        },
+        .err => |e| std.debug.print("error: {s}\n", .{e}),
+    }
+}
 ```
 
 `Program.run` reuses the program's stack and buffers, so a single Program
