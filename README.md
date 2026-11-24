@@ -89,7 +89,16 @@ Command line:
     ./zig-out/bin/cel eval --bind x=42 --bind items='[1, 2, 3]' \
         'items.filter(x, x > 1).map(x, x * x)'
 
-As a library:
+As a library, add the package (`zig fetch --save <tarball-or-url>` writes the
+`.dependencies` entry) and wire up the module:
+
+```zig
+// build.zig
+const dep = b.dependency("cel", .{ .target = target, .optimize = optimize });
+exe_mod.addImport("cel", dep.module("cel"));
+```
+
+Then:
 
 ```zig
 const std = @import("std");

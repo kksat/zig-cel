@@ -4,8 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Library: CEL compiler + evaluator.
-    const lib_mod = b.createModule(.{
+    // Library: CEL compiler + evaluator. The module is registered under the
+    // name "cel" so dependents can use `dep.module("cel")` and import it
+    // as `@import("cel")`; the static library artifact is for C-style
+    // consumers and also installs the module's object code.
+    const cel_mod = b.addModule("cel", .{
         .root_source_file = b.path("src/cel.zig"),
         .target = target,
         .optimize = optimize,
@@ -13,7 +16,7 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addLibrary(.{
         .name = "cel",
-        .root_module = lib_mod,
+        .root_module = cel_mod,
         .linkage = .static,
     });
     b.installArtifact(lib);
@@ -24,12 +27,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("cel", lib_mod);
+    exe_mod.addImport("cel", cel_mod);
     const exe = b.addExecutable(.{ .name = "cel", .root_module = exe_mod });
     b.installArtifact(exe);
 
     // Unit tests.
-    const lib_tests = b.addTest(.{ .root_module = lib_mod });
+    const lib_tests = b.addTest(.{ .root_module = cel_mod });
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
@@ -42,7 +45,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    conf_mod.addImport("cel", lib_mod);
+    conf_mod.addImport("cel", cel_mod);
     const conf_tests = b.addTest(.{ .root_module = conf_mod });
     const run_conf = b.addRunArtifact(conf_tests);
     test_step.dependOn(&run_conf.step);
@@ -58,7 +61,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    bench_mod.addImport("cel", lib_mod);
+    bench_mod.addImport("cel", cel_mod);
     const bench_exe = b.addExecutable(.{ .name = "cel-bench", .root_module = bench_mod });
     const bench_cmd = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run CEL benchmarks");
