@@ -506,7 +506,7 @@ fn split(c: *Ctx, args: []const Value) Error!Value {
         n = argInt(args, 2) orelse return c.noOverload(.ext_split, args);
     }
 
-    var parts = std.ArrayList(Value){};
+    var parts: std.ArrayList(Value) = .empty;
     errdefer parts.deinit(c.alloc);
 
     if (n == 0) {
@@ -619,7 +619,7 @@ fn join(c: *Ctx, args: []const Value) Error!Value {
         (argString(args, 1) orelse return c.noOverload(.ext_join, args))
     else
         "";
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(c.alloc);
     for (args[0].list_t, 0..) |item, i| {
         if (item != .string_t) {
@@ -634,7 +634,7 @@ fn join(c: *Ctx, args: []const Value) Error!Value {
 fn quote(c: *Ctx, args: []const Value) Error!Value {
     if (args.len != 1 or args[0] != .string_t) return c.noOverload(.ext_strings_quote, args);
     const s = args[0].string_t;
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(c.alloc);
     out.append(c.alloc, '"') catch return error.OutOfMemory;
     var cp = CodePoints{ .s = s };
@@ -665,7 +665,7 @@ fn reverse(c: *Ctx, args: []const Value) Error!Value {
     const s = args[0].string_t;
     // Reverse code points: collect each code point's start offset, then
     // emit the slices back-to-front.
-    var starts = std.ArrayList(usize){};
+    var starts: std.ArrayList(usize) = .empty;
     defer starts.deinit(c.alloc);
     {
         var i: usize = 0;
@@ -675,7 +675,7 @@ fn reverse(c: *Ctx, args: []const Value) Error!Value {
             i += l;
         }
     }
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(c.alloc);
     var prev: usize = s.len;
     var i: usize = starts.items.len;
@@ -696,7 +696,7 @@ fn format(c: *Ctx, args: []const Value) Error!Value {
     if (args[1] != .list_t) return c.noOverload(.ext_format, args);
     const fmt_args = args[1].list_t;
 
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(c.alloc);
     var arg_index: usize = 0;
     var i: usize = 0;
@@ -803,13 +803,13 @@ fn formatStringV2(c: *Ctx, v: Value, out: *std.ArrayList(u8)) Error!void {
         .map_t => |m| {
             // Sort entries by their formatted key (stable).
             const Entry = struct { key: []const u8, value_str: []const u8 };
-            var entries = std.ArrayList(Entry){};
+            var entries: std.ArrayList(Entry) = .empty;
             defer entries.deinit(c.alloc);
             for (m.entries) |e| {
-                var kb = std.ArrayList(u8){};
+                var kb: std.ArrayList(u8) = .empty;
                 defer kb.deinit(c.alloc);
                 try formatStringV2(c, e.key, &kb);
-                var vb = std.ArrayList(u8){};
+                var vb: std.ArrayList(u8) = .empty;
                 defer vb.deinit(c.alloc);
                 try formatStringV2(c, e.value, &vb);
                 entries.append(c.alloc, .{
@@ -1014,7 +1014,7 @@ const ExactDecimal = struct {
         // Little-endian base-2^32 limbs. Max width:
         //   e >= 0: 53 + e <= 1024 bits
         //   e < 0:  53 + bits(5^1074) <= ~2550 bits
-        var limbs: [100]u32 = [_]u32{0} ** 100;
+        var limbs: [100]u32 = @splat(0);
         var n_limbs: usize = 1;
         limbs[0] = @truncate(m);
         if (m >> 32 != 0) {
@@ -1026,7 +1026,7 @@ const ExactDecimal = struct {
             // value = m << e (an integer).
             const limb_shift: usize = @intCast(@divTrunc(e, 32));
             const bit_shift: u5 = @intCast(@mod(e, 32));
-            var shifted: [100]u32 = [_]u32{0} ** 100;
+            var shifted: [100]u32 = @splat(0);
             var carry: u32 = 0;
             var i: usize = 0;
             while (i < n_limbs) : (i += 1) {
@@ -1241,7 +1241,7 @@ fn normalize(ed: *ExactDecimal) void {
 
 /// Go strings.Replace semantics for the strings extension replace().
 fn replaceImpl(c: *Ctx, s: []const u8, old: []const u8, new: []const u8, limit: i64) Error!Value {
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(c.alloc);
 
     if (old.len == 0) {
@@ -1474,7 +1474,7 @@ const tests = struct {
             .{ .v = 123456789.0, .prec = 0, .mode = .fixed, .want = "123456789" },
         };
         for (cases) |case| {
-            var out = std.ArrayList(u8){};
+            var out: std.ArrayList(u8) = .empty;
             defer out.deinit(alloc);
             try formatDoubleExact(alloc, &out, case.v, case.prec, case.mode);
             try testing.expectEqualStrings(case.want, out.items);

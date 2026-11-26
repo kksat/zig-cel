@@ -323,7 +323,7 @@ const Vm = struct {
             // Container-qualified: rebuild (previous list freed; the strings
             // themselves live in the run arena).
             const old = prog.run_candidates[i];
-            var list = std.ArrayList([]const u8){};
+            var list: std.ArrayList([]const u8) = .empty;
             errdefer list.deinit(backing);
             var end = container.len;
             while (true) {
@@ -707,7 +707,7 @@ const Vm = struct {
 
     fn doCall(vm: *Vm, inst: Inst) ExecError!void {
         const arity: usize = inst.b;
-        const fid: stdlib.FnId = @enumFromInt(inst.a);
+        const fid: stdlib.FnId = @fromBackingInt(@intCast(inst.a));
         // Fast paths for the common operators: equality and int ordering.
         if (arity == 2) {
             if (fid == .eq or fid == .ne) {
@@ -1304,7 +1304,7 @@ pub const Compiler = struct {
                     c.pushDepth();
                     return;
                 }
-                try c.emit(.{ .op = .call, .a = @intFromEnum(fid), .b = @intCast(kids.len) });
+                try c.emit(.{ .op = .call, .a = @backingInt(fid), .b = @intCast(kids.len) });
                 c.pushDepth();
             },
 
@@ -1386,7 +1386,7 @@ pub const Compiler = struct {
     /// The dotted name of a pure select chain rooted at an ident, if this
     /// node is (the tail of) one.
     fn chainOf(c: *Compiler, node: ast.NodeIndex) ?Chain {
-        var parts = std.ArrayList([]const u8){};
+        var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(c.alloc);
         var abs = false;
         var cur = node;
@@ -1407,7 +1407,7 @@ pub const Compiler = struct {
             }
         }
         std.mem.reverse([]const u8, parts.items);
-        var out = std.ArrayList(u8){};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(c.alloc);
         for (parts.items, 0..) |p, i| {
             if (i > 0) out.append(c.alloc, '.') catch return null;

@@ -190,7 +190,7 @@ pub const Evaluator = struct {
             // Container-qualified resolution takes precedence over the bare
             // name (namespace.textproto: self_eval_container_lookup).
             if (ev.container.len > 0) {
-                var prefixes = std.ArrayList([]const u8){};
+                var prefixes: std.ArrayList([]const u8) = .empty;
                 defer prefixes.deinit(ev.alloc);
                 try containerPrefixes(ev.container, &prefixes, ev.alloc);
                 for (prefixes.items) |pfx| {
@@ -210,7 +210,7 @@ pub const Evaluator = struct {
     /// Collect the dotted name of a pure select chain rooted at an ident,
     /// e.g. `google.protobuf.Timestamp`. Returns null for anything else.
     fn qualifiedName(ev: *Evaluator, node: ast.NodeIndex) ?QualifiedName {
-        var parts = std.ArrayList([]const u8){};
+        var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(ev.alloc);
         var abs = false;
         var cur = node;
@@ -231,7 +231,7 @@ pub const Evaluator = struct {
             }
         }
         std.mem.reverse([]const u8, parts.items);
-        var out = std.ArrayList(u8){};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(ev.alloc);
         for (parts.items, 0..) |p, i| {
             if (i > 0) out.append(ev.alloc, '.') catch return null;
@@ -254,7 +254,7 @@ pub const Evaluator = struct {
                     if (ev.qualifiedName(node)) |q| {
                         // Absolute names (`.a.b`) resolve only in the root
                         // scope; others try the container prefixes first.
-                        var prefixes = std.ArrayList([]const u8){};
+                        var prefixes: std.ArrayList([]const u8) = .empty;
                         defer prefixes.deinit(ev.alloc);
                         if (q.abs) {
                             try prefixes.append(ev.alloc, "");
@@ -355,7 +355,7 @@ pub const Evaluator = struct {
         const name = n.payload.str;
 
         // Evaluate all arguments (strict evaluation).
-        var args = std.ArrayList(Value){};
+        var args: std.ArrayList(Value) = .empty;
         defer args.deinit(ev.alloc);
         for (kids) |k| {
             try args.append(ev.alloc, try ev.eval(k));
@@ -434,7 +434,7 @@ pub const Evaluator = struct {
                 return .{ .bool_t = count == 1 };
             },
             .filter => {
-                var out = std.ArrayList(Value){};
+                var out: std.ArrayList(Value) = .empty;
                 defer out.deinit(ev.alloc);
                 for (range.items) |item| {
                     try ev.scopes.append(ev.alloc, .{ .name = var_name, .value = item });
@@ -450,7 +450,7 @@ pub const Evaluator = struct {
                 return .{ .list_t = try ev.alloc.dupe(Value, out.items) };
             },
             .map, .map_filter => {
-                var out = std.ArrayList(Value){};
+                var out: std.ArrayList(Value) = .empty;
                 defer out.deinit(ev.alloc);
                 const transform = if (has_transform) kids[3] else pred;
                 const filter = if (has_transform) pred else null;

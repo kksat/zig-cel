@@ -47,7 +47,7 @@ fn makeBindings(a: std.mem.Allocator) ![]Binding {
 
 const cases = [_]Case{
     .{ .name = "literal_arith", .expr = "1 + 2 * 3 - 4 / 2 % 1 == 6" },
-    .{ .name = "var_compare", .expr = "x < 100 && x > 10 || y == 42", .vars = &[_]Binding{.{ .name = "x", .value = .{ .int_t = 42 } }, .{ .name = "y", .value = .{ .int_t = 17 } }} },
+    .{ .name = "var_compare", .expr = "x < 100 && x > 10 || y == 42", .vars = &[_]Binding{ .{ .name = "x", .value = .{ .int_t = 42 } }, .{ .name = "y", .value = .{ .int_t = 17 } } } },
     .{ .name = "string_ops", .expr = "name.startsWith('prefix') && name.contains('middle') && name.endsWith('suffix')", .vars = &[_]Binding{.{ .name = "name", .value = .{ .string_t = "prefix-middle-suffix" } }} },
     .{ .name = "regex_match", .expr = "email.matches('^[a-z]+@[a-z]+\\\\.[a-z]{2,}$')", .vars = &[_]Binding{.{ .name = "email", .value = .{ .string_t = "user@example.com" } }} },
     .{ .name = "map_access", .expr = "payload['user'] == 'alice' && payload.count > 40" },
@@ -144,12 +144,13 @@ fn scaleNs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
     const w = &stdout.interface;
+    defer stdout.flush() catch {};
 
     // Shared bindings for the default variable set.
     var bind_arena = std.heap.ArenaAllocator.init(alloc);
@@ -160,7 +161,6 @@ pub fn main() !void {
 
     var parse_total_ns: u64 = 0;
     var compile_total_ns: u64 = 0;
-    var timer = try std.time.Timer.start();
 
     for (cases) |case| {
         var vars = case.vars;
@@ -177,12 +177,12 @@ pub fn main() !void {
             _ = try vm.Compiler.compile(parse_arena.allocator(), warm.ok, .{ .ext = case.ext });
         }
         _ = parse_arena.reset(.retain_capacity);
-        timer.reset();
+        const parse_start = std.Io.Timestamp.now(init.io, .awake);
         const r = try parser.parseSrc(parse_arena.allocator(), case.expr, .{ .ext = case.ext });
-        const parse_ns = timer.read();
-        timer.reset();
+        const parse_ns: u64 = @intCast(parse_start.durationTo(std.Io.Timestamp.now(init.io, .awake)).nanoseconds);
+        const compile_start = std.Io.Timestamp.now(init.io, .awake);
         _ = try vm.Compiler.compile(parse_arena.allocator(), r.ok, .{ .ext = case.ext });
-        const compile_ns = timer.read();
+        const compile_ns: u64 = @intCast(compile_start.durationTo(std.Io.Timestamp.now(init.io, .awake)).nanoseconds);
         parse_total_ns += parse_ns;
         compile_total_ns += compile_ns;
         const tree = switch (r) {
@@ -227,13 +227,14 @@ pub fn main() !void {
 
         var b: usize = 0;
         while (b < batches) : (b += 1) {
-            timer.reset();
+            const b_start = std.Io.Timestamp.now(init.io, .awake);
             var j: usize = 0;
             while (j < batch) : (j += 1) {
                 _ = run_arena.reset(.retain_capacity);
                 _ = prog.run(run_arena.allocator(), vars, "", .{}) catch {};
             }
-            times[b] = timer.read() / batch;
+            const b_ns = b_start.durationTo(std.Io.Timestamp.now(init.io, .awake)).nanoseconds;
+            times[b] = @intCast(@divTrunc(b_ns, @as(i96, batch)));
             total_allocs += counting.allocs;
             total_bytes += counting.bytes;
         }
@@ -251,9 +252,12 @@ pub fn main() !void {
         };
         try w.print("{s:<22} {d:>8.1} {s} {d:>8.1} {s} {d:>8.1} {s} {d:>9.1} {d:>10.1}\n", .{
             case.name,
-            scaleNs(tr.min_ns),  fmtNs(tr.min_ns),
-            scaleNs(tr.median_ns), fmtNs(tr.median_ns),
-            scaleNs(tr.mean_ns),  fmtNs(tr.mean_ns),
+            scaleNs(tr.min_ns),
+            fmtNs(tr.min_ns),
+            scaleNs(tr.median_ns),
+            fmtNs(tr.median_ns),
+            scaleNs(tr.mean_ns),
+            fmtNs(tr.mean_ns),
             tr.allocs_per_op,
             tr.bytes_per_op,
         });

@@ -177,7 +177,7 @@ pub const Value = union(enum) {
     /// compare key sets and values.
     pub fn eql(a: Value, b: Value) bool {
         if (a.isNumeric() and b.isNumeric()) return numericEql(a, b);
-        if (@intFromEnum(std.meta.activeTag(a)) != @intFromEnum(std.meta.activeTag(b))) return false;
+        if (@backingInt(std.meta.activeTag(a)) != @backingInt(std.meta.activeTag(b))) return false;
         switch (a) {
             .null_t => return true,
             .bool_t => |x| return x == b.bool_t,
@@ -265,7 +265,7 @@ pub const Value = union(enum) {
     /// (mismatched non-numeric types, or NaN involved).
     pub fn compare(a: Value, b: Value) ?std.math.Order {
         if (a.isNumeric() and b.isNumeric()) return numericCompare(a, b);
-        if (@intFromEnum(std.meta.activeTag(a)) != @intFromEnum(std.meta.activeTag(b))) return null;
+        if (@backingInt(std.meta.activeTag(a)) != @backingInt(std.meta.activeTag(b))) return null;
         switch (a) {
             .bool_t => |x| {
                 const y = b.bool_t;
@@ -359,7 +359,7 @@ pub const Value = union(enum) {
                 for (m.entries) |e| h ^= hashMix(hash(e.key), hash(e.value));
                 return h;
             },
-            .type_t => |t| return hashMix(0x13, @intFromEnum(t)),
+            .type_t => |t| return hashMix(0x13, @backingInt(t)),
             .duration_t => |d| return hashMix(0x14, @bitCast(d.seconds)) ^ hashMix(0, @as(u32, @bitCast(d.nanos))),
             .timestamp_t => |t| return hashMix(0x15, @bitCast(t.seconds)) ^ hashMix(1, t.nanos),
         }

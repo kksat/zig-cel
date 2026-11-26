@@ -56,10 +56,9 @@ const Stats = struct {
 
 var verbose = false;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-    var args = try std.process.argsWithAllocator(alloc);
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
     _ = args.next();
     while (args.next()) |arg| {
@@ -67,15 +66,17 @@ pub fn main() !void {
             verbose = true;
         }
     }
-    var stdout = std.fs.File.stdout().writer(&.{});
-    const total = try run(alloc, &stdout.interface);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const total = try run(init.io, alloc, &stdout.interface);
+    try stdout.flush();
     std.process.exit(if (total.failed > 0) 1 else 0);
 }
 
 /// Run all vendored conformance suites; returns the aggregate stats.
 /// Progress is written to `w` when non-null (the zig test runner owns
 /// stdout, so tests pass null).
-pub fn run(alloc: std.mem.Allocator, w: ?*std.Io.Writer) !Stats {
+pub fn run(io: std.Io, alloc: std.mem.Allocator, w: ?*std.Io.Writer) !Stats {
     var total = Stats{};
 
     for (test_files) |test_file| {
@@ -83,7 +84,7 @@ pub fn run(alloc: std.mem.Allocator, w: ?*std.Io.Writer) !Stats {
         const file_ext = test_file.ext;
         const path = try std.fmt.allocPrint(alloc, "conformance/testdata/{s}", .{file_name});
         defer alloc.free(path);
-        const src = std.fs.cwd().readFileAlloc(alloc, path, 16 * 1024 * 1024) catch |e| {
+        const src = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024)) catch |e| {
             if (w) |out| try out.print("missing testdata: {s} ({s})\n", .{ path, @errorName(e) });
             return e;
         };
@@ -129,7 +130,7 @@ pub fn run(alloc: std.mem.Allocator, w: ?*std.Io.Writer) !Stats {
 test "conformance suite" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const total = try run(arena.allocator(), null);
+    const total = try run(std.testing.io, arena.allocator(), null);
     if (total.failed > 0) {
         std.debug.print("conformance: {d} failures\n", .{total.failed});
         return error.TestUnexpectedResult;
@@ -174,7 +175,7 @@ fn runTest(a: std.mem.Allocator, file_name: []const u8, section: []const u8, t: 
     }
 
     // Convert bindings.
-    var bindings = std.ArrayList(eval.Binding){};
+    var bindings: std.ArrayList(eval.Binding) = .empty;
     for (t.bindings) |b| {
         switch (b.value) {
             .val => |tv| {
@@ -303,7 +304,7 @@ fn valueUnsupported(v: textproto.TValue) bool {
 }
 
 fn containsStructLiteral(a: std.mem.Allocator, tree: parser.Ast, node: parser.NodeIndex) bool {
-    var stack = std.ArrayList(parser.NodeIndex){};
+    var stack: std.ArrayList(parser.NodeIndex) = .empty;
     defer stack.deinit(a);
     stack.append(a, node) catch return false;
     while (stack.items.len > 0) {

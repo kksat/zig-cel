@@ -386,7 +386,7 @@ pub const Lexer = struct {
     /// Slow path: the literal contains at least one escape sequence; build the
     /// cooked value into an arena buffer.
     fn lexStringSlow(lex: *Lexer, prefix: StringPrefix, quote: u8, delim_len: usize, content_start: usize, start: usize) Error!Token {
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(lex.alloc);
         try buf.ensureTotalCapacity(lex.alloc, @intCast(lex.pos - content_start));
 
@@ -547,7 +547,7 @@ pub const Lexer = struct {
 
 test "lex simple expression" {
     var lex = Lexer.init(std.testing.allocator, "a.b <= 42 && 'x' in [1, 2.5]");
-    var toks = std.ArrayList(Token){};
+    var toks: std.ArrayList(Token) = .empty;
     defer toks.deinit(std.testing.allocator);
     while (true) {
         const t = try lex.next();

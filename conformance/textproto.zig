@@ -214,7 +214,7 @@ const Lexer = struct {
     fn lexString(lex: *Lexer) Error![]const u8 {
         const quote = lex.src[lex.pos];
         lex.pos += 1;
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(lex.alloc);
         while (true) {
             if (lex.pos >= lex.src.len) return lex.fail("unterminated string");
@@ -406,7 +406,7 @@ pub const Parser = struct {
     /// Read a string value, concatenating adjacent string literals
     /// (textproto implicit concatenation across lines).
     fn readString(p: *Parser) Error![]const u8 {
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         const first = try p.next();
         if (first != .string) return error.Parse;
         try buf.appendSlice(p.alloc, first.string);
@@ -426,7 +426,7 @@ pub const Parser = struct {
 
     fn parseFile(p: *Parser) Error!File {
         var name: []const u8 = "";
-        var sections = std.ArrayList(Section){};
+        var sections: std.ArrayList(Section) = .empty;
         while (true) {
             try p.skipCommas();
             const t = try p.next();
@@ -448,7 +448,7 @@ pub const Parser = struct {
 
     fn parseSection(p: *Parser) Error!Section {
         var name: []const u8 = "";
-        var tests = std.ArrayList(Test){};
+        var tests: std.ArrayList(Test) = .empty;
         const lead = try p.lex.peek();
         if (lead == .colon) _ = try p.next();
         const open = try p.next();
@@ -472,7 +472,7 @@ pub const Parser = struct {
 
     fn parseTest(p: *Parser) Error!Test {
         var out_test = Test{ .name = "", .expr = "" };
-        var bindings = std.ArrayList(Binding){};
+        var bindings: std.ArrayList(Binding) = .empty;
         var result: Result = .default_true;
         const lead = try p.lex.peek();
         if (lead == .colon) _ = try p.next();
@@ -671,7 +671,7 @@ pub const Parser = struct {
         if (lead == .colon) _ = try p.next();
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
-        var items = std.ArrayList(TValue){};
+        var items: std.ArrayList(TValue) = .empty;
         while (true) {
             try p.skipCommas();
             const t = try p.next();
@@ -691,7 +691,7 @@ pub const Parser = struct {
         if (lead == .colon) _ = try p.next();
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
-        var entries = std.ArrayList(TEntry){};
+        var entries: std.ArrayList(TEntry) = .empty;
         while (true) {
             try p.skipCommas();
             const t = try p.next();
@@ -776,7 +776,7 @@ pub const Parser = struct {
         if (lead == .colon) _ = try p.next();
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
-        var msgs = std.ArrayList([]const u8){};
+        var msgs: std.ArrayList([]const u8) = .empty;
         while (true) {
             try p.skipCommas();
             const t = try p.next();
@@ -810,7 +810,7 @@ pub const Parser = struct {
         // all messages.
         const open = try p.next();
         if (open != .lbrace) return error.Parse;
-        var msgs = std.ArrayList([]const u8){};
+        var msgs: std.ArrayList([]const u8) = .empty;
         while (true) {
             try p.skipCommas();
             const t = try p.next();

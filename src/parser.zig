@@ -73,7 +73,7 @@ pub const Parsed = union(enum) {
 /// Parse `src`, reporting any diagnostic in the returned value.
 pub fn parseSrc(alloc: std.mem.Allocator, src: []const u8, options: Options) std.mem.Allocator.Error!Parsed {
     var lex = lexer.Lexer.init(alloc, src);
-    var toks = std.ArrayList(token.Token){};
+    var toks: std.ArrayList(token.Token) = .empty;
     defer toks.deinit(alloc);
     while (true) {
         const t = lex.next() catch |e| switch (e) {
@@ -406,7 +406,7 @@ pub const Parser = struct {
     /// Parse a parenthesized argument list; `(` is the current token.
     fn parseArgList(p: *P) Error![]NodeIndex {
         _ = try p.expect(.lparen, "expected '('");
-        var args = std.ArrayList(NodeIndex){};
+        var args: std.ArrayList(NodeIndex) = .empty;
         defer args.deinit(p.alloc);
         if (p.cur().kind != .rparen) {
             while (true) {
@@ -425,8 +425,8 @@ pub const Parser = struct {
 
     /// The math extension function names callable as `math.<name>(...)`.
     const math_fns = [_][]const u8{
-        "@min", "@max", "ceil",   "floor", "round", "trunc", "abs",
-        "sign", "isInf", "isNaN", "isFinite", "sqrt", "bitAnd", "bitOr",
+        "@min",   "@max",   "ceil",         "floor",         "round", "trunc",  "abs",
+        "sign",   "isInf",  "isNaN",        "isFinite",      "sqrt",  "bitAnd", "bitOr",
         "bitXor", "bitNot", "bitShiftLeft", "bitShiftRight",
     };
 
@@ -492,7 +492,7 @@ pub const Parser = struct {
 
         const m = mkind.?;
         const n = try p.addNode(.{ .kind = .macro, .start = start, .end = p.prevEnd(), .payload = .{ .macro = m } });
-        var kids = std.ArrayList(NodeIndex){};
+        var kids: std.ArrayList(NodeIndex) = .empty;
         defer kids.deinit(p.alloc);
         try kids.append(p.alloc, args[0]); // iteration variable (ident node)
         try kids.append(p.alloc, target); // range
@@ -650,10 +650,10 @@ pub const Parser = struct {
         }
 
         // Qualified name chain, possibly ending in a message literal.
-        var segments = std.ArrayList([]const u8){};
+        var segments: std.ArrayList([]const u8) = .empty;
         defer segments.deinit(p.alloc);
         try segments.append(p.alloc, first.text);
-        var seg_ends = std.ArrayList(u32){};
+        var seg_ends: std.ArrayList(u32) = .empty;
         defer seg_ends.deinit(p.alloc);
         try seg_ends.append(p.alloc, first.end);
         while (p.cur().kind == .dot and p.peek(1).kind == .ident and !p.peek(1).is_reserved) {
@@ -713,7 +713,7 @@ pub const Parser = struct {
     fn parseListLiteral(p: *P) Error!NodeIndex {
         const start = p.cur().start;
         _ = try p.expect(.lbracket, "expected '['");
-        var elems = std.ArrayList(NodeIndex){};
+        var elems: std.ArrayList(NodeIndex) = .empty;
         defer elems.deinit(p.alloc);
         if (p.cur().kind != .rbracket) {
             while (true) {
@@ -735,7 +735,7 @@ pub const Parser = struct {
     fn parseMapLiteral(p: *P) Error!NodeIndex {
         const start = p.cur().start;
         _ = try p.expect(.lbrace, "expected '{'");
-        var entries = std.ArrayList(NodeIndex){};
+        var entries: std.ArrayList(NodeIndex) = .empty;
         defer entries.deinit(p.alloc);
         if (p.cur().kind != .rbrace) {
             while (true) {
@@ -761,14 +761,14 @@ pub const Parser = struct {
     fn parseStructLiteral(p: *P, segments: []const []const u8, abs: bool, start: u32) Error!NodeIndex {
         // Message construction M{f: v, ...}.
         _ = try p.expect(.lbrace, "expected '{'");
-        var name = std.ArrayList(u8){};
+        var name: std.ArrayList(u8) = .empty;
         defer name.deinit(p.alloc);
         if (abs) try name.append(p.alloc, '.');
         for (segments, 0..) |seg, i| {
             if (i > 0) try name.append(p.alloc, '.');
             try name.appendSlice(p.alloc, seg);
         }
-        var entries = std.ArrayList(NodeIndex){};
+        var entries: std.ArrayList(NodeIndex) = .empty;
         defer entries.deinit(p.alloc);
         if (p.cur().kind != .rbrace) {
             while (true) {
@@ -1121,7 +1121,7 @@ const tests = struct {
     test "deep nesting bounded" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         for (0..300) |_| try buf.append(testing.allocator, '(');
         try buf.appendSlice(testing.allocator, "1");

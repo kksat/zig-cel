@@ -27,16 +27,15 @@ fn parseBindingValue(alloc: std.mem.Allocator, text: []const u8) !Value {
     return ev.run(&.{}) catch return error.InvalidBinding;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
 
-    var args = try std.process.argsWithAllocator(alloc);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
     _ = args.next(); // program name
 
     var expr: ?[]const u8 = null;
-    var bindings = std.ArrayList(eval.Binding){};
+    var bindings: std.ArrayList(eval.Binding) = .empty;
     defer bindings.deinit(alloc);
     var extensions: cel.ext.Extensions = .{};
     // Arena that keeps binding values alive for the whole run.
@@ -112,9 +111,8 @@ pub fn main() !void {
 
     var aw = std.Io.Writer.Allocating.init(a);
     try v.format(&aw.writer);
-    var stdout = std.fs.File.stdout().writer(&.{});
-    try stdout.interface.writeAll(aw.written());
-    try stdout.interface.writeAll("\n");
+    try std.Io.File.stdout().writeStreamingAll(init.io, aw.written());
+    try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
 }
 
 /// Deep-copy a value (strings, bytes, lists, maps) into another allocator.

@@ -105,7 +105,7 @@ const PatternParser = struct {
         p.depth += 1;
         defer p.depth -= 1;
         if (p.depth > 200) return error.TooComplex;
-        var branches = std.ArrayList(Node){};
+        var branches: std.ArrayList(Node) = .empty;
         defer branches.deinit(p.alloc);
         try branches.append(p.alloc, try p.parseConcat());
         while (p.peekByte() == '|') {
@@ -121,7 +121,7 @@ const PatternParser = struct {
     }
 
     fn parseConcat(p: *PatternParser) Error!Node {
-        var parts = std.ArrayList(Node){};
+        var parts: std.ArrayList(Node) = .empty;
         defer parts.deinit(p.alloc);
         while (p.peekByte()) |c| {
             if (c == '|' or c == ')') break;

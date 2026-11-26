@@ -101,8 +101,8 @@ pub const keywords = [_][]const u8{ "true", "false", "null", "in" };
 /// name segments. The lexer reports them as `ident` with a reserved flag so
 /// the parser can enforce the context.
 pub const reserved = [_][]const u8{
-    "as",       "break",  "const",   "continue", "else",     "for",
-    "function", "if",     "import",  "let",      "loop",     "package",
+    "as",        "break",  "const",  "continue", "else",  "for",
+    "function",  "if",     "import", "let",      "loop",  "package",
     "namespace", "return", "var",    "void",     "while",
 };
 
